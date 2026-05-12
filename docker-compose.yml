@@ -1,0 +1,9 @@
+services:
+  meeting-bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./recordings:/app/recordings
+      - ./debug-images:/app/debug-images
+    shm_size: "2gb"
