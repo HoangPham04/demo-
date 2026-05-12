@@ -1,0 +1,17 @@
+node_modules
+dist
+out
+.git
+
+**/bin
+**/obj
+
+backend/ClassroomBackend/GoogleClassroomTokens
+backend/ClassroomBackend/classroom-demo.db
+backend/ClassroomBackend/classroom-demo.db-shm
+backend/ClassroomBackend/classroom-demo.db-wal
+backend/ClassroomBackend/Data/live-tracking-events.json
+
+backend/ClassroomBackend/appsettings.Development.json
+.env
+*.env

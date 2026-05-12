@@ -1,16 +1,23 @@
-FROM mcr.microsoft.com/playwright:v1.49.1-jammy
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+WORKDIR /src
+
+COPY backend/ClassroomBackend/ClassroomBackend.csproj backend/ClassroomBackend/
+RUN dotnet restore backend/ClassroomBackend/ClassroomBackend.csproj
+
+COPY . .
+
+RUN dotnet publish backend/ClassroomBackend/ClassroomBackend.csproj -c Release -o /app/publish /p:UseAppHost=false
+
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install
+COPY --from=build /app/publish .
 
-COPY tsconfig.json ./
-COPY src ./src
+ENV ASPNETCORE_ENVIRONMENT=Production
 
-RUN npm run build
+EXPOSE 8080
 
-ENV NODE_ENV=production
-ENV HEADLESS=false
-
-CMD ["node", "dist/index.js"]
+CMD ["sh", "-c", "dotnet ClassroomBackend.dll --urls http://0.0.0.0:${PORT:-8080}"]
