@@ -1,0 +1,56 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Node / Vite build
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# .NET build
+bin/
+obj/
+out/
+**/bin/
+**/obj/
+**/out/
+
+# Editor files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Env files / local secrets
+.env
+*.env
+backend/ClassroomBackend/.env
+
+# Google OAuth local tokens
+GoogleClassroomTokens/
+**/GoogleClassroomTokens/
+backend/ClassroomBackend/GoogleClassroomTokens/
+
+# SQLite local database / temp files
+backend/ClassroomBackend/classroom-demo.db
+*.db-shm
+*.db-wal
+
+# Local appsettings secrets
+appsettings.Development.json
+**/appsettings.Development.json
+backend/ClassroomBackend/appsettings.Development.json
+
+# Local live tracking data
+backend/ClassroomBackend/Data/live-tracking-events.json

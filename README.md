@@ -1,39 +1,16 @@
-# Google Meet Bot - recovered self-host code
+# React + Vite
 
-This package contains the old self-host Google Meet bot flow:
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-Google Meet link -> Playwright/Chromium opens Meet -> bot asks to join -> records tab using MediaRecorder -> saves WebM chunks to local disk.
+Currently, two official plugins are available:
 
-Important:
-- `src/bots/GoogleMeetBot.ts` is copied from the file you uploaded.
-- The support files are reconstructed from the imports and the previous flow so the project structure is complete enough to review/run.
-- This is the heavy local/Docker approach. For production, Recall.ai is lighter because Recall runs the bot for you.
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-## Run locally
+## React Compiler
 
-```powershell
-cp .env.example .env
-npm install
-npx playwright install chromium
-npm run dev
-```
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
-## Run Docker
+## Expanding the ESLint configuration
 
-```powershell
-docker compose up --build
-```
-
-## Output
-
-Recordings are saved to:
-
-```text
-./recordings
-```
-
-Debug screenshots are saved to:
-
-```text
-./debug-images
-```
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.

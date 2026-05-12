@@ -1,0 +1,192 @@
+/* LIVE CLASS MONITOR TABLE - FIX COLUMN LAYOUT */
+.live-monitor-table {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #eee6ff;
+  border-radius: 18px;
+  background: #ffffff;
+  margin-top: 20px;
+}
+
+.live-monitor-row {
+  display: grid;
+  grid-template-columns: 260px 180px 180px 110px 110px 110px 190px;
+  gap: 18px;
+  align-items: center;
+  min-width: 1250px;
+  padding: 16px 20px;
+  border-bottom: 1px solid #eee6ff;
+}
+
+.live-monitor-row:last-child {
+  border-bottom: none;
+}
+
+.live-monitor-head {
+  background: #fbf9ff;
+  color: #514663;
+  font-weight: 900;
+}
+
+.live-monitor-cell {
+  display: block;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.live-monitor-student-name {
+  display: block;
+  font-weight: 900;
+  color: #151226;
+  margin-bottom: 4px;
+}
+
+.live-monitor-student-email {
+  display: block;
+  color: #746f84;
+  font-size: 13px;
+}
+
+.live-monitor-time {
+  white-space: nowrap;
+  font-size: 14px;
+  color: #151226;
+}
+
+.live-monitor-status {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.live-monitor-status.ok {
+  background: #e9fff2;
+  color: #08783c;
+}
+
+.live-monitor-status.failed {
+  background: #fff1f1;
+  color: #b42318;
+}
+
+.live-monitor-status.missing {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.live-monitor-status.not-yet {
+  background: #fff4dc;
+  color: #a56700;
+}
+
+@media (max-width: 900px) {
+  .live-monitor-table {
+    overflow-x: auto;
+  }
+
+  .live-monitor-row {
+    min-width: 1250px;
+  }
+}
+/* ===== LIVE CLASS MONITOR TABLE ===== */
+
+.live-monitor-table {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #eee6ff;
+  border-radius: 18px;
+  background: #ffffff;
+  margin-top: 20px;
+}
+
+.live-monitor-row {
+  display: grid;
+  grid-template-columns: 260px 180px 180px 110px 110px 110px 190px;
+  gap: 18px;
+  align-items: center;
+  min-width: 1250px;
+  padding: 16px 20px;
+  border-bottom: 1px solid #eee6ff;
+}
+
+.live-monitor-row:last-child {
+  border-bottom: none;
+}
+
+.live-monitor-head {
+  background: #fbf9ff;
+  color: #514663;
+  font-weight: 900;
+}
+
+.live-monitor-row span {
+  display: block;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.live-monitor-row strong {
+  display: block;
+  font-weight: 900;
+  color: #151226;
+  margin-bottom: 4px;
+}
+
+.live-monitor-row small {
+  display: block;
+  color: #746f84;
+  font-size: 13px;
+}
+
+.live-monitor-time {
+  white-space: nowrap;
+  font-size: 14px;
+  color: #151226;
+}
+
+.live-monitor-status {
+  display: inline-flex !important;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.live-monitor-status.ok {
+  background: #e9fff2;
+  color: #08783c;
+}
+
+.live-monitor-status.failed {
+  background: #fff1f1;
+  color: #b42318;
+}
+
+.live-monitor-status.missing {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.live-monitor-status.not-yet {
+  background: #fff4dc;
+  color: #a56700;
+}
+
+@media (max-width: 900px) {
+  .live-monitor-table {
+    overflow-x: auto;
+  }
+
+  .live-monitor-row {
+    min-width: 1250px;
+  }
+}
