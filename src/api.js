@@ -37,6 +37,38 @@ async function request(path, options = {}) {
   return response.json();
 }
 
+function buildMeetAuditSummaryQuery(filters = {}) {
+  const params = new URLSearchParams();
+
+  if (filters.meetingCode?.trim()) {
+    params.append("meetingCode", filters.meetingCode.trim());
+  }
+
+  if (filters.dateFrom) {
+    params.append("dateFrom", filters.dateFrom);
+  }
+
+  if (filters.dateTo) {
+    params.append("dateTo", filters.dateTo);
+  }
+
+  if (filters.attendeeEmail?.trim()) {
+    params.append("attendeeEmail", filters.attendeeEmail.trim());
+  }
+
+  const query = params.toString();
+
+  return query ? `?${query}` : "";
+}
+
+function openDownload(path) {
+  window.open(`${API_BASE_URL}${path}`, "_blank", "noopener,noreferrer");
+}
+
+export function getApiBaseUrl() {
+  return API_BASE_URL;
+}
+
 export function getCourses() {
   return request("/api/courses");
 }
@@ -119,12 +151,37 @@ export function clearLiveClassTracking() {
    GOOGLE MEET ADMIN LOGS
    ========================= */
 
-export function getMeetAuditSummary(meetingCode = "") {
-  const query = meetingCode
-    ? `?meetingCode=${encodeURIComponent(meetingCode)}`
-    : "";
+export function getMeetAuditSummary(filters = {}) {
+  const normalizedFilters =
+    typeof filters === "string"
+      ? { meetingCode: filters }
+      : filters || {};
+
+  const query = buildMeetAuditSummaryQuery(normalizedFilters);
 
   return request(`/api/google/meet-audit-summary${query}`);
+}
+
+export function exportMeetAuditSummaryCsv(filters = {}) {
+  const normalizedFilters =
+    typeof filters === "string"
+      ? { meetingCode: filters }
+      : filters || {};
+
+  const query = buildMeetAuditSummaryQuery(normalizedFilters);
+
+  openDownload(`/api/google/meet-audit-summary/export/csv${query}`);
+}
+
+export function exportMeetAuditSummaryXlsx(filters = {}) {
+  const normalizedFilters =
+    typeof filters === "string"
+      ? { meetingCode: filters }
+      : filters || {};
+
+  const query = buildMeetAuditSummaryQuery(normalizedFilters);
+
+  openDownload(`/api/google/meet-audit-summary/export/xlsx${query}`);
 }
 
 /* =========================

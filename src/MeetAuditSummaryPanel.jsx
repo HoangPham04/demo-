@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createCalendarEvent, getMeetAuditSummary } from "./api";
-
+import {
+  createCalendarEvent,
+  exportMeetAuditSummaryCsv,
+  exportMeetAuditSummaryXlsx,
+  getMeetAuditSummary,
+} from "./api";
 
 const CLASS_CONFIG = {
   BFTZRNGDZP: {
@@ -41,6 +45,7 @@ function getStudentKey(item) {
     `${item.meetingCode}-${item.joinedAt}`
   );
 }
+
 function toLocalIsoWithOffset(datetimeLocalValue) {
   const date = new Date(datetimeLocalValue);
 
@@ -61,6 +66,7 @@ function toLocalIsoWithOffset(datetimeLocalValue) {
 
   return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${sign}${offsetHours}:${offsetMins}`;
 }
+
 function mergeStudentRecords(records) {
   const map = new Map();
 
@@ -121,24 +127,41 @@ export default function MeetAuditSummaryPanel() {
   const [logs, setLogs] = useState([]);
   const [selectedClassKey, setSelectedClassKey] = useState("");
   const [searchText, setSearchText] = useState("");
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [auditMeetingCode, setAuditMeetingCode] = useState("");
-const [createForm, setCreateForm] = useState({
-  summary: "Calendar Web Create Test",
-  start: "",
-  end: "",
-  attendees:
-    "ame.nguyen@algo.edu.vn\njay.pham@algo.edu.vn\nphamhoang1061@gmail.com\nhoangnekk104@gmail.com",
-});
 
-const [creatingEvent, setCreatingEvent] = useState(false);
-const [createError, setCreateError] = useState("");
-const [createdEvent, setCreatedEvent] = useState(null);
+  const [auditMeetingCode, setAuditMeetingCode] = useState("");
+  const [auditDateFrom, setAuditDateFrom] = useState("");
+  const [auditDateTo, setAuditDateTo] = useState("");
+  const [auditAttendeeEmail, setAuditAttendeeEmail] = useState("");
+
+  const [createForm, setCreateForm] = useState({
+    summary: "Calendar Web Create Test",
+    start: "",
+    end: "",
+    attendees:
+      "ame.nguyen@algo.edu.vn\njay.pham@algo.edu.vn\nphamhoang1061@gmail.com\nhoangnekk104@gmail.com",
+  });
+
+  const [creatingEvent, setCreatingEvent] = useState(false);
+  const [createError, setCreateError] = useState("");
+  const [createdEvent, setCreatedEvent] = useState(null);
+
   const detailRef = useRef(null);
 
-   const loadLogs = useCallback(
-    async (silent = false) => {
+  const buildAuditFilters = useCallback(
+    () => ({
+      meetingCode: auditMeetingCode.trim().toUpperCase(),
+      dateFrom: auditDateFrom,
+      dateTo: auditDateTo,
+      attendeeEmail: auditAttendeeEmail.trim(),
+    }),
+    [auditMeetingCode, auditDateFrom, auditDateTo, auditAttendeeEmail]
+  );
+
+  const loadLogs = useCallback(
+    async (silent = false, overrideFilters = null) => {
       try {
         if (!silent) {
           setLoading(true);
@@ -146,10 +169,20 @@ const [createdEvent, setCreatedEvent] = useState(null);
 
         setError("");
 
-        const meetingCode = auditMeetingCode.trim().toUpperCase();
-        const result = await getMeetAuditSummary(meetingCode);
+        const filters = overrideFilters || buildAuditFilters();
+        const result = await getMeetAuditSummary(filters);
 
         setLogs(Array.isArray(result.data) ? result.data : []);
+        setSelectedClassKey((currentKey) => {
+          if (!currentKey) return currentKey;
+
+          const stillExists = (result.data || []).some((item) => {
+            const key = item.conferenceId || item.meetingCode || "UNKNOWN";
+            return key === currentKey;
+          });
+
+          return stillExists ? currentKey : "";
+        });
       } catch (err) {
         console.error(err);
 
@@ -162,8 +195,9 @@ const [createdEvent, setCreatedEvent] = useState(null);
         }
       }
     },
-    [auditMeetingCode]
+    [buildAuditFilters]
   );
+
   useEffect(() => {
     loadLogs(false);
 
@@ -173,6 +207,36 @@ const [createdEvent, setCreatedEvent] = useState(null);
 
     return () => clearInterval(intervalId);
   }, [loadLogs]);
+
+  const handleSearchAuditLogs = () => {
+    loadLogs(false);
+  };
+
+  const handleClearAuditFilters = () => {
+    const emptyFilters = {
+      meetingCode: "",
+      dateFrom: "",
+      dateTo: "",
+      attendeeEmail: "",
+    };
+
+    setAuditMeetingCode("");
+    setAuditDateFrom("");
+    setAuditDateTo("");
+    setAuditAttendeeEmail("");
+    setSearchText("");
+    setSelectedClassKey("");
+
+    loadLogs(false, emptyFilters);
+  };
+
+  const handleExportCsv = () => {
+    exportMeetAuditSummaryCsv(buildAuditFilters());
+  };
+
+  const handleExportXlsx = () => {
+    exportMeetAuditSummaryXlsx(buildAuditFilters());
+  };
 
   const classGroups = useMemo(() => {
     const map = new Map();
@@ -433,55 +497,57 @@ const [createdEvent, setCreatedEvent] = useState(null);
       </span>
     );
   };
-const handleCreateCalendarEvent = async (event) => {
-  event.preventDefault();
 
-  try {
-    setCreatingEvent(true);
-    setCreateError("");
-    setCreatedEvent(null);
+  const handleCreateCalendarEvent = async (event) => {
+    event.preventDefault();
 
-    const attendees = createForm.attendees
-      .split(/[\n,;]/)
-      .map((email) => email.trim())
-      .filter(Boolean);
+    try {
+      setCreatingEvent(true);
+      setCreateError("");
+      setCreatedEvent(null);
 
-    if (!createForm.summary.trim()) {
-      setCreateError("Please enter class/event name.");
-      return;
+      const attendees = createForm.attendees
+        .split(/[\n,;]/)
+        .map((email) => email.trim())
+        .filter(Boolean);
+
+      if (!createForm.summary.trim()) {
+        setCreateError("Please enter class/event name.");
+        return;
+      }
+
+      if (!createForm.start || !createForm.end) {
+        setCreateError("Please select start and end time.");
+        return;
+      }
+
+      if (attendees.length === 0) {
+        setCreateError("Please enter at least one attendee email.");
+        return;
+      }
+
+      const result = await createCalendarEvent({
+        summary: createForm.summary.trim(),
+        description: "Created from web for Calendar + Meet audit test",
+        start: toLocalIsoWithOffset(createForm.start),
+        end: toLocalIsoWithOffset(createForm.end),
+        timeZone: "Asia/Ho_Chi_Minh",
+        attendees,
+      });
+
+      setCreatedEvent(result);
+
+      if (result?.meetingCode) {
+        setAuditMeetingCode(result.meetingCode);
+      }
+    } catch (err) {
+      console.error(err);
+      setCreateError("Cannot create Calendar event.");
+    } finally {
+      setCreatingEvent(false);
     }
+  };
 
-    if (!createForm.start || !createForm.end) {
-      setCreateError("Please select start and end time.");
-      return;
-    }
-
-    if (attendees.length === 0) {
-      setCreateError("Please enter at least one attendee email.");
-      return;
-    }
-
-    const result = await createCalendarEvent({
-      summary: createForm.summary.trim(),
-      description: "Created from web for Calendar + Meet audit test",
-      start: toLocalIsoWithOffset(createForm.start),
-      end: toLocalIsoWithOffset(createForm.end),
-      timeZone: "Asia/Ho_Chi_Minh",
-      attendees,
-    });
-
-     setCreatedEvent(result);
-
-    if (result?.meetingCode) {
-      setAuditMeetingCode(result.meetingCode);
-    }
-  } catch (err) {
-    console.error(err);
-    setCreateError("Cannot create Calendar event.");
-  } finally {
-    setCreatingEvent(false);
-  }
-};
   const handleSelectClass = (groupKey) => {
     setSelectedClassKey(groupKey);
 
@@ -504,160 +570,246 @@ const handleCreateCalendarEvent = async (event) => {
             seconds.
           </p>
         </div>
+      </div>
 
-                <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
-          <input
-            className="audit-input"
-            value={auditMeetingCode}
-            onChange={(event) =>
-              setAuditMeetingCode(
-                event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "")
-              )
-            }
-            placeholder="Meeting code, e.g. XJWGYMVFGW"
-            style={{ width: "280px" }}
-          />
+      <div className="class-detail-panel">
+        <div className="selected-class-header">
+          <div>
+            <div className="kicker">Search Toolbar</div>
+            <h4>Search / Filter Report</h4>
+            <p>
+              Filter by event date, meeting code, or attendee email, then export
+              the current result to CSV or XLSX.
+            </p>
+          </div>
 
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() => loadLogs(false)}
-          >
-            Refresh Logs
-          </button>
+          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleSearchAuditLogs}
+              disabled={loading}
+            >
+              {loading ? "Searching..." : "Search"}
+            </button>
+
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleClearAuditFilters}
+              disabled={loading}
+            >
+              Clear
+            </button>
+
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleExportCsv}
+            >
+              Export CSV
+            </button>
+
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleExportXlsx}
+            >
+              Export XLSX
+            </button>
+          </div>
+        </div>
+
+        <div className="class-action-summary compact">
+          <div className="action-summary-card">
+            <span>Meeting Code</span>
+            <input
+              className="audit-input"
+              value={auditMeetingCode}
+              onChange={(event) =>
+                setAuditMeetingCode(
+                  event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "")
+                )
+              }
+              placeholder="Example: XJWGYMVFGW"
+            />
+          </div>
+
+          <div className="action-summary-card">
+            <span>Event Date From</span>
+            <input
+              className="audit-input"
+              type="date"
+              value={auditDateFrom}
+              onChange={(event) => setAuditDateFrom(event.target.value)}
+            />
+          </div>
+
+          <div className="action-summary-card">
+            <span>Event Date To</span>
+            <input
+              className="audit-input"
+              type="date"
+              value={auditDateTo}
+              onChange={(event) => setAuditDateTo(event.target.value)}
+            />
+          </div>
+
+          <div className="action-summary-card">
+            <span>Attendee Email</span>
+            <input
+              className="audit-input"
+              value={auditAttendeeEmail}
+              onChange={(event) => setAuditAttendeeEmail(event.target.value)}
+              placeholder="Search attendee email"
+            />
+          </div>
         </div>
       </div>
-<form className="class-detail-panel" onSubmit={handleCreateCalendarEvent}>
-  <div className="selected-class-header">
-    <div>
-      <div className="kicker">Google Calendar</div>
-      <h4>Create Calendar Event + Meet Link</h4>
-      <p>Create a test class session directly from the web.</p>
-    </div>
 
-    <button type="submit" className="secondary-button" disabled={creatingEvent}>
-      {creatingEvent ? "Creating..." : "Create Event"}
-    </button>
-  </div>
+      <form className="class-detail-panel" onSubmit={handleCreateCalendarEvent}>
+        <div className="selected-class-header">
+          <div>
+            <div className="kicker">Google Calendar</div>
+            <h4>Create Calendar Event + Meet Link</h4>
+            <p>Create a test class session directly from the web.</p>
+          </div>
 
-  <div className="class-action-summary compact">
-    <div className="action-summary-card">
-      <span>Class/Event Name</span>
-      <input
-        className="audit-input"
-        value={createForm.summary}
-        onChange={(event) =>
-          setCreateForm((current) => ({
-            ...current,
-            summary: event.target.value,
-          }))
-        }
-        placeholder="Calendar Web Create Test"
-      />
-    </div>
+          <button type="submit" className="secondary-button" disabled={creatingEvent}>
+            {creatingEvent ? "Creating..." : "Create Event"}
+          </button>
+        </div>
 
-    <div className="action-summary-card">
-      <span>Start Time</span>
-      <input
-        className="audit-input"
-        type="datetime-local"
-        value={createForm.start}
-        onChange={(event) =>
-          setCreateForm((current) => ({
-            ...current,
-            start: event.target.value,
-          }))
-        }
-      />
-    </div>
+        <div className="class-action-summary compact">
+          <div className="action-summary-card">
+            <span>Class/Event Name</span>
+            <input
+              className="audit-input"
+              value={createForm.summary}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  summary: event.target.value,
+                }))
+              }
+              placeholder="Calendar Web Create Test"
+            />
+          </div>
 
-    <div className="action-summary-card">
-      <span>End Time</span>
-      <input
-        className="audit-input"
-        type="datetime-local"
-        value={createForm.end}
-        onChange={(event) =>
-          setCreateForm((current) => ({
-            ...current,
-            end: event.target.value,
-          }))
-        }
-      />
-    </div>
+          <div className="action-summary-card">
+            <span>Start Time</span>
+            <input
+              className="audit-input"
+              type="datetime-local"
+              value={createForm.start}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  start: event.target.value,
+                }))
+              }
+            />
+          </div>
 
-    <div className="action-summary-card">
-      <span>Attendee Emails</span>
-      <textarea
-        className="audit-input"
-        rows={5}
-        value={createForm.attendees}
-        onChange={(event) =>
-          setCreateForm((current) => ({
-            ...current,
-            attendees: event.target.value,
-          }))
-        }
-        placeholder="One email per line"
-      />
-    </div>
-  </div>
+          <div className="action-summary-card">
+            <span>End Time</span>
+            <input
+              className="audit-input"
+              type="datetime-local"
+              value={createForm.end}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  end: event.target.value,
+                }))
+              }
+            />
+          </div>
 
-  {createError && <div className="error-state">{createError}</div>}
+          <div className="action-summary-card">
+            <span>Attendee Emails</span>
+            <textarea
+              className="audit-input"
+              rows={5}
+              value={createForm.attendees}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  attendees: event.target.value,
+                }))
+              }
+              placeholder="One email per line"
+            />
+          </div>
+        </div>
 
- {createdEvent?.success && (
-  <div className="success-state">
-    <strong>Calendar event created successfully.</strong>
+        {createError && <div className="error-state">{createError}</div>}
 
-    <div>Meeting Code: {createdEvent.meetingCode}</div>
+        {createdEvent?.success && (
+          <div className="success-state">
+            <strong>Calendar event created successfully.</strong>
 
-    <div>
-      Meet Link:{" "}
-      <a href={createdEvent.meetLink} target="_blank" rel="noreferrer">
-        {createdEvent.meetLink}
-      </a>
-    </div>
+            <div>Meeting Code: {createdEvent.meetingCode}</div>
 
-    <div style={{ display: "flex", gap: "10px", marginTop: "12px", flexWrap: "wrap" }}>
-      <button
-        type="button"
-        className="secondary-button"
-        onClick={() => navigator.clipboard.writeText(createdEvent.meetingCode || "")}
-      >
-        Copy Meeting Code
-      </button>
+            <div>
+              Meet Link:{" "}
+              <a href={createdEvent.meetLink} target="_blank" rel="noreferrer">
+                {createdEvent.meetLink}
+              </a>
+            </div>
 
-      <button
-        type="button"
-        className="secondary-button"
-        onClick={() => navigator.clipboard.writeText(createdEvent.meetLink || "")}
-      >
-        Copy Meet Link
-      </button>
+            <div
+              style={{
+                display: "flex",
+                gap: "10px",
+                marginTop: "12px",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() =>
+                  navigator.clipboard.writeText(createdEvent.meetingCode || "")
+                }
+              >
+                Copy Meeting Code
+              </button>
 
-      <a
-        className="secondary-button"
-        href={createdEvent.meetLink}
-        target="_blank"
-        rel="noreferrer"
-      >
-        Open Meet
-      </a>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() =>
+                  navigator.clipboard.writeText(createdEvent.meetLink || "")
+                }
+              >
+                Copy Meet Link
+              </button>
 
-      {createdEvent.htmlLink && (
-        <a
-          className="secondary-button"
-          href={createdEvent.htmlLink}
-          target="_blank"
-          rel="noreferrer"
-        >
-          Open Calendar Event
-        </a>
-      )}
-    </div>
-  </div>
-)}
-</form>
+              <a
+                className="secondary-button"
+                href={createdEvent.meetLink}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open Meet
+              </a>
+
+              {createdEvent.htmlLink && (
+                <a
+                  className="secondary-button"
+                  href={createdEvent.htmlLink}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Open Calendar Event
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+      </form>
+
       <div className="audit-stats-grid">
         <div className="audit-stat-card">
           <span>Total Meet Sessions</span>

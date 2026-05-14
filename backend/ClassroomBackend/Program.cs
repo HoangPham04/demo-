@@ -1,3 +1,4 @@
+using ClosedXML.Excel;
 using ClassroomBackend.Data;
 using ClassroomBackend.Dtos;
 using ClassroomBackend.Models;
@@ -29,7 +30,11 @@ builder.Services.AddCors(options =>
     options.AddPolicy("AllowFrontend", policy =>
     {
         policy
-            .WithOrigins(frontendUrl, "http://localhost:5173")
+            .WithOrigins(
+    frontendUrl,
+    "http://localhost:5173",
+    "http://localhost:5174"
+)
             .AllowAnyHeader()
             .AllowAnyMethod();
     });
@@ -1442,127 +1447,524 @@ string ResolveEmailFromCalendarRoster(
 app.MapGet("/api/google/meet-audit-summary", async (
     IConfiguration configuration,
     CancellationToken cancellationToken,
-    string? meetingCode
+    string? meetingCode,
+    DateTime? dateFrom,
+    DateTime? dateTo,
+    string? attendeeEmail
 ) =>
 {
     try
     {
-        var credential = CreateGoogleCredential(configuration);
-
-        if (credential == null)
-        {
-            return Results.Json(
-                new
-                {
-                    success = false,
-                    message = "Google OAuth token not found. Please connect Google first."
-                },
-                statusCode: 401
-            );
-        }
-
-        if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
-        {
-            var refreshed = await credential.RefreshTokenAsync(cancellationToken);
-
-            if (!refreshed)
-            {
-                return Results.Json(
-                    new
-                    {
-                        success = false,
-                        message = "Google OAuth token expired and refresh failed. Please connect Google again."
-                    },
-                    statusCode: 401
-                );
-            }
-        }
-
-        var targetMeetingCode = NormalizeMeetingCode(meetingCode);
-
-        var calendarAttendeesByMeetingCode = new Dictionary<string, List<(string Email, string DisplayName)>>(StringComparer.OrdinalIgnoreCase);
-        var calendarSummaryByMeetingCode = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        var calendarService = new CalendarService(
-            new BaseClientService.Initializer
-            {
-                HttpClientInitializer = credential,
-                ApplicationName = "Algo Live Class Portal"
-            }
+        var rows = await BuildMeetAuditSummaryRowsAsync(
+            configuration,
+            cancellationToken,
+            meetingCode,
+            dateFrom,
+            dateTo,
+            attendeeEmail
         );
 
-        var calendarRequest = calendarService.Events.List("primary");
-        calendarRequest.SingleEvents = true;
-        calendarRequest.ShowDeleted = false;
-        calendarRequest.OrderBy = EventsResource.ListRequest.OrderByEnum.StartTime;
-        calendarRequest.MaxResults = 250;
-        calendarRequest.TimeMinDateTimeOffset = DateTimeOffset.UtcNow.AddDays(-7);
-        calendarRequest.TimeMaxDateTimeOffset = DateTimeOffset.UtcNow.AddDays(14);
-
-        var calendarResponse = await calendarRequest.ExecuteAsync(cancellationToken);
-
-        foreach (var calendarEvent in calendarResponse.Items ?? new List<Event>())
+        return Results.Ok(new
         {
-            var eventMeetingCode = ExtractMeetingCodeFromEvent(calendarEvent);
+            success = true,
+            total = rows.Count,
+            data = rows.Select(ToMeetAuditSummaryResponse).ToList()
+        });
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = ex.Message
+            },
+            statusCode: 401
+        );
+    }
+    catch (Google.GoogleApiException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Google API error while reading Meet audit summary.",
+                statusCode = ex.HttpStatusCode,
+                error = ex.Error?.Message,
+                details = ex.ToString()
+            },
+            statusCode: (int)ex.HttpStatusCode
+        );
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Backend error while reading Meet audit summary.",
+                error = ex.Message,
+                details = ex.ToString()
+            },
+            statusCode: 500
+        );
+    }
+});
 
-            if (string.IsNullOrWhiteSpace(eventMeetingCode))
+app.MapGet("/api/google/meet-audit-summary/export/csv", async (
+    IConfiguration configuration,
+    CancellationToken cancellationToken,
+    string? meetingCode,
+    DateTime? dateFrom,
+    DateTime? dateTo,
+    string? attendeeEmail
+) =>
+{
+    try
+    {
+        var rows = await BuildMeetAuditSummaryRowsAsync(
+            configuration,
+            cancellationToken,
+            meetingCode,
+            dateFrom,
+            dateTo,
+            attendeeEmail
+        );
+
+        var csv = new StringBuilder();
+
+        csv.AppendLine(string.Join(",", new[]
+        {
+            "Event Date",
+            "Meeting Code",
+            "Conference ID",
+            "Organizer Email",
+            "Calendar Summary",
+            "Student Name",
+            "Student Email",
+            "Meet Identifier",
+            "Identifier Type",
+            "Is External",
+            "Email Source",
+            "Joined At",
+            "Left At",
+            "Duration Minutes",
+            "Mic Used",
+            "Camera Used",
+            "Screen Shared",
+            "Mic Minutes",
+            "Camera Minutes",
+            "Screen Share Minutes",
+            "Audio Send Seconds",
+            "Video Send Seconds",
+            "Screen Send Seconds",
+            "Device Type",
+            "IP Address",
+            "Network RTT MS"
+        }.Select(MeetAuditCsvEscape)));
+
+        foreach (var row in rows)
+        {
+            csv.AppendLine(string.Join(",", new[]
+            {
+                MeetAuditCsvEscape(MeetAuditFormatVietnamDateTime(row.EventDate)),
+                MeetAuditCsvEscape(row.MeetingCode),
+                MeetAuditCsvEscape(row.ConferenceId),
+                MeetAuditCsvEscape(row.OrganizerEmail),
+                MeetAuditCsvEscape(row.CalendarSummary),
+                MeetAuditCsvEscape(row.StudentName),
+                MeetAuditCsvEscape(row.StudentEmail),
+                MeetAuditCsvEscape(row.MeetIdentifier),
+                MeetAuditCsvEscape(row.IdentifierType),
+                MeetAuditCsvEscape(row.IsExternal.ToString()),
+                MeetAuditCsvEscape(row.EmailSource),
+                MeetAuditCsvEscape(MeetAuditFormatVietnamDateTime(row.JoinedAt)),
+                MeetAuditCsvEscape(MeetAuditFormatVietnamDateTime(row.LeftAt)),
+                MeetAuditCsvEscape(row.DurationMinutes.ToString()),
+                MeetAuditCsvEscape(row.MicUsed.ToString()),
+                MeetAuditCsvEscape(row.CameraUsed.ToString()),
+                MeetAuditCsvEscape(row.ScreenShared.ToString()),
+                MeetAuditCsvEscape(row.MicMinutes.ToString()),
+                MeetAuditCsvEscape(row.CameraMinutes.ToString()),
+                MeetAuditCsvEscape(row.ScreenShareMinutes.ToString()),
+                MeetAuditCsvEscape(row.AudioSendSeconds.ToString()),
+                MeetAuditCsvEscape(row.VideoSendSeconds.ToString()),
+                MeetAuditCsvEscape(row.ScreenSendSeconds.ToString()),
+                MeetAuditCsvEscape(row.DeviceType),
+                MeetAuditCsvEscape(row.IpAddress),
+                MeetAuditCsvEscape(row.NetworkRttMs.ToString())
+            }));
+        }
+
+        var bytes = Encoding.UTF8.GetPreamble()
+            .Concat(Encoding.UTF8.GetBytes(csv.ToString()))
+            .ToArray();
+
+        return Results.File(
+            bytes,
+            "text/csv; charset=utf-8",
+            $"meet-audit-summary-{DateTime.UtcNow:yyyyMMddHHmmss}.csv"
+        );
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = ex.Message
+            },
+            statusCode: 401
+        );
+    }
+    catch (Google.GoogleApiException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Google API error while exporting Meet audit summary CSV.",
+                statusCode = ex.HttpStatusCode,
+                error = ex.Error?.Message,
+                details = ex.ToString()
+            },
+            statusCode: (int)ex.HttpStatusCode
+        );
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Backend error while exporting Meet audit summary CSV.",
+                error = ex.Message,
+                details = ex.ToString()
+            },
+            statusCode: 500
+        );
+    }
+});
+
+app.MapGet("/api/google/meet-audit-summary/export/xlsx", async (
+    IConfiguration configuration,
+    CancellationToken cancellationToken,
+    string? meetingCode,
+    DateTime? dateFrom,
+    DateTime? dateTo,
+    string? attendeeEmail
+) =>
+{
+    try
+    {
+        var rows = await BuildMeetAuditSummaryRowsAsync(
+            configuration,
+            cancellationToken,
+            meetingCode,
+            dateFrom,
+            dateTo,
+            attendeeEmail
+        );
+
+        using var workbook = new XLWorkbook();
+        var worksheet = workbook.Worksheets.Add("Meet Audit Summary");
+
+        var headers = new[]
+        {
+            "Event Date",
+            "Meeting Code",
+            "Conference ID",
+            "Organizer Email",
+            "Calendar Summary",
+            "Student Name",
+            "Student Email",
+            "Meet Identifier",
+            "Identifier Type",
+            "Is External",
+            "Email Source",
+            "Joined At",
+            "Left At",
+            "Duration Minutes",
+            "Mic Used",
+            "Camera Used",
+            "Screen Shared",
+            "Mic Minutes",
+            "Camera Minutes",
+            "Screen Share Minutes",
+            "Audio Send Seconds",
+            "Video Send Seconds",
+            "Screen Send Seconds",
+            "Device Type",
+            "IP Address",
+            "Network RTT MS"
+        };
+
+        for (var column = 0; column < headers.Length; column++)
+        {
+            worksheet.Cell(1, column + 1).Value = headers[column];
+        }
+
+        var headerRange = worksheet.Range(1, 1, 1, headers.Length);
+        headerRange.Style.Font.Bold = true;
+        headerRange.Style.Fill.BackgroundColor = XLColor.LightGray;
+
+        var rowNumber = 2;
+
+        foreach (var row in rows)
+        {
+            worksheet.Cell(rowNumber, 1).Value = MeetAuditFormatVietnamDateTime(row.EventDate);
+            worksheet.Cell(rowNumber, 2).Value = row.MeetingCode;
+            worksheet.Cell(rowNumber, 3).Value = row.ConferenceId;
+            worksheet.Cell(rowNumber, 4).Value = row.OrganizerEmail;
+            worksheet.Cell(rowNumber, 5).Value = row.CalendarSummary;
+            worksheet.Cell(rowNumber, 6).Value = row.StudentName;
+            worksheet.Cell(rowNumber, 7).Value = row.StudentEmail;
+            worksheet.Cell(rowNumber, 8).Value = row.MeetIdentifier;
+            worksheet.Cell(rowNumber, 9).Value = row.IdentifierType;
+            worksheet.Cell(rowNumber, 10).Value = row.IsExternal;
+            worksheet.Cell(rowNumber, 11).Value = row.EmailSource;
+            worksheet.Cell(rowNumber, 12).Value = MeetAuditFormatVietnamDateTime(row.JoinedAt);
+            worksheet.Cell(rowNumber, 13).Value = MeetAuditFormatVietnamDateTime(row.LeftAt);
+            worksheet.Cell(rowNumber, 14).Value = row.DurationMinutes;
+            worksheet.Cell(rowNumber, 15).Value = row.MicUsed;
+            worksheet.Cell(rowNumber, 16).Value = row.CameraUsed;
+            worksheet.Cell(rowNumber, 17).Value = row.ScreenShared;
+            worksheet.Cell(rowNumber, 18).Value = row.MicMinutes;
+            worksheet.Cell(rowNumber, 19).Value = row.CameraMinutes;
+            worksheet.Cell(rowNumber, 20).Value = row.ScreenShareMinutes;
+            worksheet.Cell(rowNumber, 21).Value = row.AudioSendSeconds;
+            worksheet.Cell(rowNumber, 22).Value = row.VideoSendSeconds;
+            worksheet.Cell(rowNumber, 23).Value = row.ScreenSendSeconds;
+            worksheet.Cell(rowNumber, 24).Value = row.DeviceType;
+            worksheet.Cell(rowNumber, 25).Value = row.IpAddress;
+            worksheet.Cell(rowNumber, 26).Value = row.NetworkRttMs;
+
+            rowNumber++;
+        }
+
+        worksheet.Columns().AdjustToContents();
+
+        using var stream = new MemoryStream();
+        workbook.SaveAs(stream);
+
+        return Results.File(
+            stream.ToArray(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            $"meet-audit-summary-{DateTime.UtcNow:yyyyMMddHHmmss}.xlsx"
+        );
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = ex.Message
+            },
+            statusCode: 401
+        );
+    }
+    catch (Google.GoogleApiException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Google API error while exporting Meet audit summary XLSX.",
+                statusCode = ex.HttpStatusCode,
+                error = ex.Error?.Message,
+                details = ex.ToString()
+            },
+            statusCode: (int)ex.HttpStatusCode
+        );
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Backend error while exporting Meet audit summary XLSX.",
+                error = ex.Message,
+                details = ex.ToString()
+            },
+            statusCode: 500
+        );
+    }
+});
+
+string NormalizeMeetingCode(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return "";
+    }
+
+    var raw = value.Trim();
+
+    if (raw.Contains("meet.google.com", StringComparison.OrdinalIgnoreCase))
+    {
+        raw = raw.Split('?')[0].TrimEnd('/').Split('/').LastOrDefault() ?? raw;
+    }
+
+    var cleaned = new string(raw
+        .Where(char.IsLetterOrDigit)
+        .ToArray());
+
+    return cleaned.ToUpperInvariant();
+}
+
+string ExtractMeetingCodeFromEvent(Event calendarEvent)
+{
+    var hangoutLinkCode = NormalizeMeetingCode(calendarEvent.HangoutLink);
+
+    if (!string.IsNullOrWhiteSpace(hangoutLinkCode))
+    {
+        return hangoutLinkCode;
+    }
+
+    var videoEntryPoint = calendarEvent.ConferenceData?.EntryPoints?
+        .FirstOrDefault(entryPoint =>
+            string.Equals(entryPoint.EntryPointType, "video", StringComparison.OrdinalIgnoreCase)
+        );
+
+    return NormalizeMeetingCode(videoEntryPoint?.Uri);
+}
+async Task<List<MeetAuditSummaryRow>> BuildMeetAuditSummaryRowsAsync(
+    IConfiguration configuration,
+    CancellationToken cancellationToken,
+    string? meetingCode,
+    DateTime? dateFrom,
+    DateTime? dateTo,
+    string? attendeeEmail
+)
+{
+    var credential = CreateGoogleCredential(configuration);
+
+    if (credential == null)
+    {
+        throw new UnauthorizedAccessException("Google OAuth token not found. Please connect Google first.");
+    }
+
+    if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
+    {
+        var refreshed = await credential.RefreshTokenAsync(cancellationToken);
+
+        if (!refreshed)
+        {
+            throw new UnauthorizedAccessException("Google OAuth token expired and refresh failed. Please connect Google again.");
+        }
+    }
+
+    var vietnamTimeZone = MeetAuditGetVietnamTimeZone();
+    var dateRange = MeetAuditBuildVietnamDateRange(dateFrom, dateTo);
+    var targetMeetingCode = NormalizeMeetingCode(meetingCode);
+    var attendeeEmailKeyword = attendeeEmail?.Trim().ToLowerInvariant() ?? "";
+
+    var calendarAttendeesByMeetingCode =
+        new Dictionary<string, List<(string Email, string DisplayName)>>(StringComparer.OrdinalIgnoreCase);
+
+    var calendarSummaryByMeetingCode =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    var calendarStartByMeetingCode =
+        new Dictionary<string, DateTimeOffset?>(StringComparer.OrdinalIgnoreCase);
+
+    var calendarService = new CalendarService(
+        new BaseClientService.Initializer
+        {
+            HttpClientInitializer = credential,
+            ApplicationName = "Algo Live Class Portal"
+        }
+    );
+
+    var calendarRequest = calendarService.Events.List("primary");
+    calendarRequest.SingleEvents = true;
+    calendarRequest.ShowDeleted = false;
+    calendarRequest.OrderBy = EventsResource.ListRequest.OrderByEnum.StartTime;
+    calendarRequest.MaxResults = 250;
+
+    calendarRequest.TimeMinDateTimeOffset = dateRange.FromUtc ?? DateTimeOffset.UtcNow.AddDays(-7);
+    calendarRequest.TimeMaxDateTimeOffset = dateRange.ToUtcExclusive ?? DateTimeOffset.UtcNow.AddDays(14);
+
+    var calendarResponse = await calendarRequest.ExecuteAsync(cancellationToken);
+
+    foreach (var calendarEvent in calendarResponse.Items ?? new List<Event>())
+    {
+        var eventMeetingCode = ExtractMeetingCodeFromEvent(calendarEvent);
+
+        if (string.IsNullOrWhiteSpace(eventMeetingCode))
+        {
+            continue;
+        }
+
+        if (!calendarAttendeesByMeetingCode.ContainsKey(eventMeetingCode))
+        {
+            calendarAttendeesByMeetingCode[eventMeetingCode] = new List<(string Email, string DisplayName)>();
+        }
+
+        if (!calendarSummaryByMeetingCode.ContainsKey(eventMeetingCode))
+        {
+            calendarSummaryByMeetingCode[eventMeetingCode] = calendarEvent.Summary ?? "";
+        }
+
+        if (!calendarStartByMeetingCode.ContainsKey(eventMeetingCode))
+        {
+            calendarStartByMeetingCode[eventMeetingCode] = MeetAuditGetCalendarEventStart(calendarEvent, vietnamTimeZone);
+        }
+
+        foreach (var attendee in calendarEvent.Attendees ?? new List<EventAttendee>())
+        {
+            if (string.IsNullOrWhiteSpace(attendee.Email))
             {
                 continue;
             }
 
-            if (!calendarAttendeesByMeetingCode.ContainsKey(eventMeetingCode))
-            {
-                calendarAttendeesByMeetingCode[eventMeetingCode] = new List<(string Email, string DisplayName)>();
-            }
-
-            if (!calendarSummaryByMeetingCode.ContainsKey(eventMeetingCode))
-            {
-                calendarSummaryByMeetingCode[eventMeetingCode] = calendarEvent.Summary ?? "";
-            }
-
-            foreach (var attendee in calendarEvent.Attendees ?? new List<EventAttendee>())
-            {
-                if (string.IsNullOrWhiteSpace(attendee.Email))
-                {
-                    continue;
-                }
-
-                calendarAttendeesByMeetingCode[eventMeetingCode].Add((
-                    attendee.Email,
-                    attendee.DisplayName ?? ""
-                ));
-            }
+            calendarAttendeesByMeetingCode[eventMeetingCode].Add((
+                attendee.Email,
+                attendee.DisplayName ?? ""
+            ));
         }
+    }
 
-        foreach (var key in calendarAttendeesByMeetingCode.Keys.ToList())
+    foreach (var key in calendarAttendeesByMeetingCode.Keys.ToList())
+    {
+        calendarAttendeesByMeetingCode[key] = calendarAttendeesByMeetingCode[key]
+            .GroupBy(attendee => attendee.Email, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+    }
+
+    var reportsService = new Google.Apis.Admin.Reports.reports_v1.ReportsService(
+        new Google.Apis.Services.BaseClientService.Initializer
         {
-            calendarAttendeesByMeetingCode[key] = calendarAttendeesByMeetingCode[key]
-                .GroupBy(attendee => attendee.Email, StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
-                .ToList();
+            HttpClientInitializer = credential,
+            ApplicationName = "Algo Live Class Portal"
         }
+    );
 
-        var reportsService = new Google.Apis.Admin.Reports.reports_v1.ReportsService(
-            new Google.Apis.Services.BaseClientService.Initializer
-            {
-                HttpClientInitializer = credential,
-                ApplicationName = "Algo Live Class Portal"
-            }
-        );
+    var request = reportsService.Activities.List(
+        "all",
+        Google.Apis.Admin.Reports.reports_v1.ActivitiesResource.ListRequest.ApplicationNameEnum.Meet
+    );
 
-        var request = reportsService.Activities.List(
-            "all",
-            Google.Apis.Admin.Reports.reports_v1.ActivitiesResource.ListRequest.ApplicationNameEnum.Meet
-        );
+    request.MaxResults = 1000;
+    request.StartTime = (dateRange.FromUtc ?? DateTimeOffset.UtcNow.AddDays(-7))
+        .UtcDateTime
+        .ToString("yyyy-MM-dd'T'HH:mm:ss'Z'");
 
-        request.MaxResults = 100;
-        request.StartTime = DateTime.UtcNow
-            .AddDays(-7)
+    if (dateRange.ToUtcExclusive.HasValue)
+    {
+        request.EndTime = dateRange.ToUtcExclusive.Value
+            .UtcDateTime
             .ToString("yyyy-MM-dd'T'HH:mm:ss'Z'");
+    }
 
+    var rows = new List<MeetAuditSummaryRow>();
+
+    do
+    {
         var result = await request.ExecuteAsync(cancellationToken);
-
-        var rows = new List<object>();
 
         if (result.Items != null)
         {
@@ -1626,7 +2028,14 @@ app.MapGet("/api/google/meet-audit-summary", async (
                         calendarRoster
                     );
 
+                    if (!string.IsNullOrWhiteSpace(attendeeEmailKeyword) &&
+                        !resolvedEmail.ToLowerInvariant().Contains(attendeeEmailKeyword))
+                    {
+                        continue;
+                    }
+
                     calendarSummaryByMeetingCode.TryGetValue(code, out var calendarSummary);
+                    calendarStartByMeetingCode.TryGetValue(code, out var calendarEventDate);
 
                     var startTimestampSeconds = GetLong("start_timestamp_seconds");
                     var durationSeconds = GetLong("duration_seconds");
@@ -1636,131 +2045,248 @@ app.MapGet("/api/google/meet-audit-summary", async (
 
                     if (startTimestampSeconds > 0)
                     {
-                        joinedAt = DateTimeOffset
-                            .FromUnixTimeSeconds(startTimestampSeconds)
-                            .ToLocalTime();
-
+                        var joinedAtUtc = DateTimeOffset.FromUnixTimeSeconds(startTimestampSeconds);
+                        joinedAt = TimeZoneInfo.ConvertTime(joinedAtUtc, vietnamTimeZone);
                         leftAt = joinedAt.Value.AddSeconds(durationSeconds);
+                    }
+
+                    var eventDate = calendarEventDate ?? joinedAt;
+
+                    if (!MeetAuditIsInsideDateRange(eventDate, dateRange))
+                    {
+                        continue;
                     }
 
                     var audioSendSeconds = GetLong("audio_send_seconds");
                     var videoSendSeconds = GetLong("video_send_seconds");
                     var screenSendSeconds = GetLong("screencast_send_seconds");
 
-                    rows.Add(new
+                    rows.Add(new MeetAuditSummaryRow
                     {
-                        meetingCode = code,
-                        conferenceId = GetValue("conference_id"),
-                        organizerEmail = GetValue("organizer_email"),
+                        EventDate = eventDate,
 
-                        calendarSummary = calendarSummary ?? "",
-                        calendarRosterEmails = calendarRoster.Select(attendee => attendee.Email).ToList(),
-                        calendarRosterCount = calendarRoster.Count,
+                        MeetingCode = code,
+                        ConferenceId = GetValue("conference_id"),
+                        OrganizerEmail = GetValue("organizer_email"),
 
-                        studentName = displayName,
-                        studentEmail = resolvedEmail,
-                        meetIdentifier = rawIdentifier,
-                        identifierType = GetValue("identifier_type"),
-                        isExternal = GetBool("is_external"),
+                        CalendarSummary = calendarSummary ?? "",
+                        CalendarRosterEmails = calendarRoster.Select(attendee => attendee.Email).ToList(),
+                        CalendarRosterCount = calendarRoster.Count,
 
-                        emailSource = IsMaskedOrMissingEmail(rawIdentifier)
+                        StudentName = displayName,
+                        StudentEmail = resolvedEmail,
+                        MeetIdentifier = rawIdentifier,
+                        IdentifierType = GetValue("identifier_type"),
+                        IsExternal = GetBool("is_external"),
+
+                        EmailSource = IsMaskedOrMissingEmail(rawIdentifier)
                             ? (resolvedEmail == "Unknown external participant" ? "unknown" : "calendar")
                             : "meet_audit",
 
-                        joinedAt = joinedAt?.ToString("yyyy-MM-dd HH:mm:ss"),
-                        leftAt = leftAt?.ToString("yyyy-MM-dd HH:mm:ss"),
-                        durationMinutes = Math.Round(durationSeconds / 60.0, 1),
+                        JoinedAt = joinedAt,
+                        LeftAt = leftAt,
+                        DurationMinutes = Math.Round(durationSeconds / 60.0, 1),
 
-                        micUsed = audioSendSeconds > 0,
-                        cameraUsed = videoSendSeconds > 0,
-                        screenShared = screenSendSeconds > 0,
+                        MicUsed = audioSendSeconds > 0,
+                        CameraUsed = videoSendSeconds > 0,
+                        ScreenShared = screenSendSeconds > 0,
 
-                        audioSendSeconds,
-                        videoSendSeconds,
-                        screenSendSeconds,
+                        MicMinutes = Math.Round(audioSendSeconds / 60.0, 1),
+                        CameraMinutes = Math.Round(videoSendSeconds / 60.0, 1),
+                        ScreenShareMinutes = Math.Round(screenSendSeconds / 60.0, 1),
 
-                        deviceType = GetValue("device_type"),
-                        ipAddress = GetValue("ip_address"),
-                        networkRttMs = GetLong("network_rtt_msec_mean")
+                        AudioSendSeconds = audioSendSeconds,
+                        VideoSendSeconds = videoSendSeconds,
+                        ScreenSendSeconds = screenSendSeconds,
+
+                        DeviceType = GetValue("device_type"),
+                        IpAddress = GetValue("ip_address"),
+                        NetworkRttMs = GetLong("network_rtt_msec_mean")
                     });
                 }
             }
         }
 
-        return Results.Ok(new
-        {
-            success = true,
-            total = rows.Count,
-            data = rows
-        });
+        request.PageToken = result.NextPageToken;
     }
-    catch (Google.GoogleApiException ex)
-    {
-        return Results.Json(
-            new
-            {
-                success = false,
-                message = "Google API error while reading Meet audit summary.",
-                statusCode = ex.HttpStatusCode,
-                error = ex.Error?.Message,
-                details = ex.ToString()
-            },
-            statusCode: (int)ex.HttpStatusCode
-        );
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(
-            new
-            {
-                success = false,
-                message = "Backend error while reading Meet audit summary.",
-                error = ex.Message,
-                details = ex.ToString()
-            },
-            statusCode: 500
-        );
-    }
-});
+    while (!string.IsNullOrWhiteSpace(request.PageToken));
 
-string NormalizeMeetingCode(string? value)
+    return rows
+        .OrderByDescending(row => row.EventDate)
+        .ThenBy(row => row.StudentEmail)
+        .ToList();
+}
+
+object ToMeetAuditSummaryResponse(MeetAuditSummaryRow row)
 {
-    if (string.IsNullOrWhiteSpace(value))
+    return new
+    {
+        eventDate = MeetAuditFormatVietnamDateTime(row.EventDate),
+
+        meetingCode = row.MeetingCode,
+        conferenceId = row.ConferenceId,
+        organizerEmail = row.OrganizerEmail,
+
+        calendarSummary = row.CalendarSummary,
+        calendarRosterEmails = row.CalendarRosterEmails,
+        calendarRosterCount = row.CalendarRosterCount,
+
+        studentName = row.StudentName,
+        studentEmail = row.StudentEmail,
+        meetIdentifier = row.MeetIdentifier,
+        identifierType = row.IdentifierType,
+        isExternal = row.IsExternal,
+
+        emailSource = row.EmailSource,
+
+        joinedAt = MeetAuditFormatVietnamDateTime(row.JoinedAt),
+        leftAt = MeetAuditFormatVietnamDateTime(row.LeftAt),
+        durationMinutes = row.DurationMinutes,
+
+        micUsed = row.MicUsed,
+        cameraUsed = row.CameraUsed,
+        screenShared = row.ScreenShared,
+
+        micMinutes = row.MicMinutes,
+        cameraMinutes = row.CameraMinutes,
+        screenShareMinutes = row.ScreenShareMinutes,
+
+        audioSendSeconds = row.AudioSendSeconds,
+        videoSendSeconds = row.VideoSendSeconds,
+        screenSendSeconds = row.ScreenSendSeconds,
+
+        deviceType = row.DeviceType,
+        ipAddress = row.IpAddress,
+        networkRttMs = row.NetworkRttMs
+    };
+}
+
+TimeZoneInfo MeetAuditGetVietnamTimeZone()
+{
+    try
+    {
+        return TimeZoneInfo.FindSystemTimeZoneById("Asia/Ho_Chi_Minh");
+    }
+    catch
+    {
+        return TimeZoneInfo.FindSystemTimeZoneById("SE Asia Standard Time");
+    }
+}
+
+(DateTimeOffset? FromUtc, DateTimeOffset? ToUtcExclusive) MeetAuditBuildVietnamDateRange(
+    DateTime? dateFrom,
+    DateTime? dateTo
+)
+{
+    var vietnamTimeZone = MeetAuditGetVietnamTimeZone();
+
+    DateTimeOffset? fromUtc = null;
+    DateTimeOffset? toUtcExclusive = null;
+
+    if (dateFrom.HasValue)
+    {
+        var localFrom = DateTime.SpecifyKind(dateFrom.Value.Date, DateTimeKind.Unspecified);
+        var fromUtcDateTime = TimeZoneInfo.ConvertTimeToUtc(localFrom, vietnamTimeZone);
+        fromUtc = new DateTimeOffset(fromUtcDateTime, TimeSpan.Zero);
+    }
+
+    if (dateTo.HasValue)
+    {
+        var localToExclusive = DateTime.SpecifyKind(dateTo.Value.Date.AddDays(1), DateTimeKind.Unspecified);
+        var toUtcDateTime = TimeZoneInfo.ConvertTimeToUtc(localToExclusive, vietnamTimeZone);
+        toUtcExclusive = new DateTimeOffset(toUtcDateTime, TimeSpan.Zero);
+    }
+
+    return (fromUtc, toUtcExclusive);
+}
+
+bool MeetAuditIsInsideDateRange(
+    DateTimeOffset? eventDate,
+    (DateTimeOffset? FromUtc, DateTimeOffset? ToUtcExclusive) dateRange
+)
+{
+    if (!dateRange.FromUtc.HasValue && !dateRange.ToUtcExclusive.HasValue)
+    {
+        return true;
+    }
+
+    if (!eventDate.HasValue)
+    {
+        return false;
+    }
+
+    var eventDateUtc = eventDate.Value.ToUniversalTime();
+
+    if (dateRange.FromUtc.HasValue && eventDateUtc < dateRange.FromUtc.Value)
+    {
+        return false;
+    }
+
+    if (dateRange.ToUtcExclusive.HasValue && eventDateUtc >= dateRange.ToUtcExclusive.Value)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+DateTimeOffset? MeetAuditGetCalendarEventStart(Event calendarEvent, TimeZoneInfo vietnamTimeZone)
+{
+    if (calendarEvent.Start?.DateTimeDateTimeOffset != null)
+    {
+        return TimeZoneInfo.ConvertTime(
+            calendarEvent.Start.DateTimeDateTimeOffset.Value,
+            vietnamTimeZone
+        );
+    }
+
+    if (!string.IsNullOrWhiteSpace(calendarEvent.Start?.Date))
+    {
+        if (DateTime.TryParse(calendarEvent.Start.Date, out var dateOnly))
+        {
+            var localDate = DateTime.SpecifyKind(dateOnly.Date, DateTimeKind.Unspecified);
+            var utcDate = TimeZoneInfo.ConvertTimeToUtc(localDate, vietnamTimeZone);
+            return new DateTimeOffset(utcDate, TimeSpan.Zero);
+        }
+    }
+
+    return null;
+}
+
+string MeetAuditFormatVietnamDateTime(DateTimeOffset? value)
+{
+    if (!value.HasValue)
     {
         return "";
     }
 
-    var raw = value.Trim();
+    var vietnamTimeZone = MeetAuditGetVietnamTimeZone();
+    var vietnamTime = TimeZoneInfo.ConvertTime(value.Value, vietnamTimeZone);
 
-    if (raw.Contains("meet.google.com", StringComparison.OrdinalIgnoreCase))
-    {
-        raw = raw.Split('?')[0].TrimEnd('/').Split('/').LastOrDefault() ?? raw;
-    }
-
-    var cleaned = new string(raw
-        .Where(char.IsLetterOrDigit)
-        .ToArray());
-
-    return cleaned.ToUpperInvariant();
+    return vietnamTime.ToString("yyyy-MM-dd HH:mm:ss");
 }
 
-string ExtractMeetingCodeFromEvent(Event calendarEvent)
+string MeetAuditCsvEscape(string? value)
 {
-    var hangoutLinkCode = NormalizeMeetingCode(calendarEvent.HangoutLink);
-
-    if (!string.IsNullOrWhiteSpace(hangoutLinkCode))
+    if (string.IsNullOrEmpty(value))
     {
-        return hangoutLinkCode;
+        return "";
     }
 
-    var videoEntryPoint = calendarEvent.ConferenceData?.EntryPoints?
-        .FirstOrDefault(entryPoint =>
-            string.Equals(entryPoint.EntryPointType, "video", StringComparison.OrdinalIgnoreCase)
-        );
+    var escaped = value.Replace("\"", "\"\"");
 
-    return NormalizeMeetingCode(videoEntryPoint?.Uri);
+    if (
+        escaped.Contains(",") ||
+        escaped.Contains("\"") ||
+        escaped.Contains("\n") ||
+        escaped.Contains("\r")
+    )
+    {
+        return $"\"{escaped}\"";
+    }
+
+    return escaped;
 }
-
 app.MapGet("/api/google/calendar/events", async (
     IConfiguration configuration,
     CancellationToken cancellationToken,
@@ -2117,4 +2643,44 @@ public class CreateClassroomDemoRequest
     public string? Room { get; set; }
     public string? OwnerId { get; set; }
     public List<string>? CoTeacherEmails { get; set; }
+}
+public sealed class MeetAuditSummaryRow
+{
+    public DateTimeOffset? EventDate { get; set; }
+
+    public string MeetingCode { get; set; } = "";
+    public string ConferenceId { get; set; } = "";
+    public string OrganizerEmail { get; set; } = "";
+
+    public string CalendarSummary { get; set; } = "";
+    public List<string> CalendarRosterEmails { get; set; } = new();
+    public int CalendarRosterCount { get; set; }
+
+    public string StudentName { get; set; } = "";
+    public string StudentEmail { get; set; } = "";
+    public string MeetIdentifier { get; set; } = "";
+    public string IdentifierType { get; set; } = "";
+    public bool IsExternal { get; set; }
+
+    public string EmailSource { get; set; } = "";
+
+    public DateTimeOffset? JoinedAt { get; set; }
+    public DateTimeOffset? LeftAt { get; set; }
+    public double DurationMinutes { get; set; }
+
+    public bool MicUsed { get; set; }
+    public bool CameraUsed { get; set; }
+    public bool ScreenShared { get; set; }
+
+    public double MicMinutes { get; set; }
+    public double CameraMinutes { get; set; }
+    public double ScreenShareMinutes { get; set; }
+
+    public long AudioSendSeconds { get; set; }
+    public long VideoSendSeconds { get; set; }
+    public long ScreenSendSeconds { get; set; }
+
+    public string DeviceType { get; set; } = "";
+    public string IpAddress { get; set; } = "";
+    public long NetworkRttMs { get; set; }
 }
