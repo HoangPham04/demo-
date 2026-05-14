@@ -1,3 +1,4 @@
+import ScreenRecordingPanel from "./ScreenRecordingPanel";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createCalendarEvent,
@@ -571,7 +572,7 @@ export default function MeetAuditSummaryPanel() {
           </p>
         </div>
       </div>
-
+      <ScreenRecordingPanel />
       <div className="class-detail-panel">
         <div className="selected-class-header">
           <div>
