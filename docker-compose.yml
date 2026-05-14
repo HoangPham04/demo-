@@ -7,3 +7,4 @@ services:
       - ./recordings:/app/recordings
       - ./debug-images:/app/debug-images
     shm_size: "2gb"
+  
