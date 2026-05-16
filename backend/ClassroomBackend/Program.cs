@@ -12,6 +12,9 @@ using Google.Apis.Classroom.v1.Data;
 using Google.Apis.Services;
 using Google.Apis.Calendar.v3;
 using Google.Apis.Calendar.v3.Data;
+using Google.Apis.Drive.v3;
+using Google.Apis.Upload;
+using Microsoft.AspNetCore.Http.Features;
 using Google.Apis.Util.Store;
 using System.Net.Http.Headers;
 using System.Text;
@@ -19,7 +22,15 @@ using System.Text.Json;
 using System.Globalization;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = 1024L * 1024L * 1024L; // 1GB
+});
 
+builder.Services.Configure<FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 1024L * 1024L * 1024L; // 1GB
+});
 var frontendUrl =
     builder.Configuration["FrontendUrl"]
     ?? Environment.GetEnvironmentVariable("FRONTEND_URL")
@@ -55,7 +66,40 @@ builder.Services.AddDbContext<ClassroomDbContext>(options =>
 builder.Services.AddSingleton<IClassroomService, MockClassroomService>();
 
 var app = builder.Build();
+var recordingCronEnabled =
+    builder.Configuration.GetValue<bool?>("RECORDING_CRON_ENABLED") ?? true;
 
+var recordingCronIntervalHours =
+    builder.Configuration.GetValue<int?>("RECORDING_CRON_INTERVAL_HOURS") ?? 72;
+
+if (recordingCronEnabled)
+{
+    app.Lifetime.ApplicationStarted.Register(() =>
+    {
+        _ = Task.Run(async () =>
+        {
+            var interval = TimeSpan.FromHours(recordingCronIntervalHours);
+
+            while (true)
+            {
+                try
+                {
+                    await RunRecordingCronJobAsync(
+                        app.Services,
+                        app.Configuration,
+                        CancellationToken.None
+                    );
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Recording cron job failed: {ex}");
+                }
+
+                await Task.Delay(interval);
+            }
+        });
+    });
+}
 app.UseCors("AllowFrontend");
 
 using (var scope = app.Services.CreateScope())
@@ -192,27 +236,29 @@ app.MapPost("/api/quiz-attempt", async (
     });
 });
 
-string[] googleClassroomScopes =
+string[] GetGoogleClassroomScopes()
 {
-    "https://www.googleapis.com/auth/classroom.courses.readonly",
-    "https://www.googleapis.com/auth/classroom.rosters.readonly",
-    "https://www.googleapis.com/auth/classroom.coursework.students",
-    "https://www.googleapis.com/auth/classroom.announcements",
+    return new[]
+    {
+        "https://www.googleapis.com/auth/classroom.courses.readonly",
+        "https://www.googleapis.com/auth/classroom.rosters.readonly",
+        "https://www.googleapis.com/auth/classroom.coursework.students",
+        "https://www.googleapis.com/auth/classroom.announcements",
 
-    // Create/manage Google Classroom courses
-    "https://www.googleapis.com/auth/classroom.courses",
+        // Create/manage Google Classroom courses
+        "https://www.googleapis.com/auth/classroom.courses",
 
-    // Invite/add teachers/students
-    "https://www.googleapis.com/auth/classroom.rosters",
+        // Invite/add teachers/students
+        "https://www.googleapis.com/auth/classroom.rosters",
 
-    "https://www.googleapis.com/auth/meetings.space.created",
-    "https://www.googleapis.com/auth/meetings.space.readonly",
+        "https://www.googleapis.com/auth/meetings.space.created",
+        "https://www.googleapis.com/auth/meetings.space.readonly",
+        "https://www.googleapis.com/auth/admin.reports.audit.readonly",
 
-    "https://www.googleapis.com/auth/admin.reports.audit.readonly",
-
-    // Google Calendar events / attendees
-      CalendarService.Scope.CalendarEvents,
-};
+        CalendarService.Scope.CalendarEvents,
+        DriveService.Scope.DriveFile
+    };
+}
 
 GoogleAuthorizationCodeFlow CreateGoogleFlow(IConfiguration configuration)
 {
@@ -231,13 +277,13 @@ GoogleAuthorizationCodeFlow CreateGoogleFlow(IConfiguration configuration)
             ClientId = clientId,
             ClientSecret = clientSecret
         },
-        Scopes = googleClassroomScopes,
-   DataStore = new FileDataStore(
-    configuration["GoogleClassroom:TokenDir"]
-        ?? Environment.GetEnvironmentVariable("GOOGLE_TOKEN_DIR")
-        ?? "GoogleClassroomTokens",
-    true
-)
+        Scopes = GetGoogleClassroomScopes(),
+        DataStore = new FileDataStore(
+            configuration["GoogleClassroom:TokenDir"]
+                ?? Environment.GetEnvironmentVariable("GOOGLE_TOKEN_DIR")
+                ?? "GoogleClassroomTokens",
+            true
+        )
     });
 }
 
@@ -299,7 +345,7 @@ app.MapGet("/api/google/oauth/callback", async (
     ?? Environment.GetEnvironmentVariable("FRONTEND_URL")
     ?? "http://localhost:5173";
 
-return Results.Redirect($"{frontendRedirect}?google=connected");
+    return Results.Redirect($"{frontendRedirect}?google=connected");
 });
 
 UserCredential? CreateGoogleCredential(IConfiguration configuration)
@@ -730,7 +776,7 @@ app.MapPost("/api/google/classroom/create-demo-class", async (
             );
         }
 
-        if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
+        if (credential.Token.IsStale)
         {
             var refreshed = await credential.RefreshTokenAsync(cancellationToken);
 
@@ -1214,7 +1260,7 @@ app.MapGet("/api/google/meet-audit-logs", async (
             );
         }
 
-        if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
+        if (credential.Token.IsStale)
         {
             var refreshed = await credential.RefreshTokenAsync(cancellationToken);
 
@@ -1255,7 +1301,7 @@ app.MapGet("/api/google/meet-audit-logs", async (
             .Select(item => new
             {
                 id = item.Id?.UniqueQualifier,
-                time = item.Id?.Time,
+                time = item.Id?.TimeDateTimeOffset,
                 applicationName = item.Id?.ApplicationName,
                 customerId = item.Id?.CustomerId,
                 actorEmail = item.Actor?.Email,
@@ -1846,7 +1892,7 @@ async Task<List<MeetAuditSummaryRow>> BuildMeetAuditSummaryRowsAsync(
         throw new UnauthorizedAccessException("Google OAuth token not found. Please connect Google first.");
     }
 
-    if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
+    if (credential.Token.IsStale)
     {
         var refreshed = await credential.RefreshTokenAsync(cancellationToken);
 
@@ -2309,7 +2355,7 @@ app.MapGet("/api/google/calendar/events", async (
             );
         }
 
-        if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
+        if (credential.Token.IsStale)
         {
             var refreshed = await credential.RefreshTokenAsync(cancellationToken);
 
@@ -2440,7 +2486,7 @@ app.MapPost("/api/google/calendar/events/create", async (
             );
         }
 
-        if (credential.Token.IsExpired(Google.Apis.Util.SystemClock.Default))
+        if (credential.Token.IsStale)
         {
             var refreshed = await credential.RefreshTokenAsync(cancellationToken);
 
@@ -2603,6 +2649,785 @@ app.MapPost("/api/google/calendar/events/create", async (
         );
     }
 });
+app.MapPost("/api/recordings/start", async (
+    RecordingStartRequest request,
+    ClassroomDbContext db,
+    CancellationToken cancellationToken
+) =>
+{
+    var session = new RecordingSession
+    {
+        MeetingCode = request.MeetingCode?.Trim().ToUpperInvariant() ?? "",
+        CalendarEventId = request.CalendarEventId?.Trim() ?? "",
+        ClassName = request.ClassName?.Trim() ?? "",
+        TeacherEmail = request.TeacherEmail?.Trim().ToLowerInvariant() ?? "",
+        Status = "recording",
+        StartedAt = DateTimeOffset.UtcNow,
+        CreatedAt = DateTimeOffset.UtcNow,
+        UpdatedAt = DateTimeOffset.UtcNow
+    };
+
+    db.RecordingSessions.Add(session);
+    await db.SaveChangesAsync(cancellationToken);
+
+    return Results.Ok(new
+    {
+        success = true,
+        recording = new
+        {
+            session.Id,
+            session.RecordingSessionId,
+            session.MeetingCode,
+            session.ClassName,
+            session.TeacherEmail,
+            session.Status,
+            session.StartedAt
+        }
+    });
+});
+app.MapPost("/api/google/drive/upload-recording", async (
+    HttpRequest request,
+    IConfiguration configuration,
+    ClassroomDbContext db,
+    CancellationToken cancellationToken
+) =>
+{
+    try
+    {
+        var credential = CreateGoogleCredential(configuration);
+
+        if (credential == null)
+        {
+            return Results.Json(
+                new
+                {
+                    success = false,
+                    message = "Google OAuth token not found. Please connect Google first."
+                },
+                statusCode: 401
+            );
+        }
+
+        if (credential.Token.IsStale)
+        {
+            var refreshed = await credential.RefreshTokenAsync(cancellationToken);
+
+            if (!refreshed)
+            {
+                return Results.Json(
+                    new
+                    {
+                        success = false,
+                        message = "Google OAuth token expired and refresh failed. Please connect Google again."
+                    },
+                    statusCode: 401
+                );
+            }
+        }
+
+        var folderId =
+            configuration["GOOGLE_DRIVE_RECORDING_FOLDER_ID"] ??
+            configuration["GoogleDrive:RecordingFolderId"];
+
+        if (string.IsNullOrWhiteSpace(folderId))
+        {
+            return Results.Json(
+                new
+                {
+                    success = false,
+                    message = "Google Drive recording folder ID is missing. Please set GOOGLE_DRIVE_RECORDING_FOLDER_ID."
+                },
+                statusCode: 500
+            );
+        }
+
+        if (!request.HasFormContentType)
+        {
+            return Results.Json(
+                new
+                {
+                    success = false,
+                    message = "Request must be multipart/form-data."
+                },
+                statusCode: 400
+            );
+        }
+
+        var form = await request.ReadFormAsync(cancellationToken);
+        var file = form.Files.GetFile("file");
+
+        if (file == null || file.Length == 0)
+        {
+            return Results.Json(
+                new
+                {
+                    success = false,
+                    message = "Recording file is missing."
+                },
+                statusCode: 400
+            );
+        }
+
+        var meetingCode = form["meetingCode"].ToString();
+        var durationSeconds = form["durationSeconds"].ToString();
+        var fileSizeBytes = form["fileSizeBytes"].ToString();
+
+        var originalFileName = string.IsNullOrWhiteSpace(file.FileName)
+            ? $"meet-recording-{DateTime.UtcNow:yyyyMMdd-HHmmss}.webm"
+            : file.FileName;
+
+        var safeFileName = SanitizeDriveFileName(originalFileName);
+
+        var contentType = string.IsNullOrWhiteSpace(file.ContentType)
+            ? "video/webm"
+            : file.ContentType;
+
+        var driveService = new DriveService(
+            new Google.Apis.Services.BaseClientService.Initializer
+            {
+                HttpClientInitializer = credential,
+                ApplicationName = "Algo Meet Report Dashboard"
+            }
+        );
+
+        var driveFileMetadata = new Google.Apis.Drive.v3.Data.File
+        {
+            Name = safeFileName,
+            MimeType = contentType,
+            Parents = new List<string> { folderId },
+            Description =
+                $"Uploaded from Meet report dashboard.\n" +
+                $"Meeting Code: {meetingCode}\n" +
+                $"Duration Seconds: {durationSeconds}\n" +
+                $"File Size Bytes: {fileSizeBytes}\n" +
+                $"Uploaded At UTC: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}"
+        };
+
+        await using var stream = file.OpenReadStream();
+
+        var uploadRequest = driveService.Files.Create(
+            driveFileMetadata,
+            stream,
+            contentType
+        );
+
+        uploadRequest.Fields = "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
+
+        var uploadProgress = await uploadRequest.UploadAsync(cancellationToken);
+
+        if (uploadProgress.Status == UploadStatus.Failed)
+        {
+            return Results.Json(
+                new
+                {
+                    success = false,
+                    message = "Google Drive upload failed.",
+                    error = uploadProgress.Exception?.Message
+                },
+                statusCode: 500
+            );
+        }
+
+        var uploadedFile = uploadRequest.ResponseBody;
+var formRecordingSessionId = form["recordingSessionId"].ToString();
+var formTeacherEmail = form["teacherEmail"].ToString();
+var formClassName = form["className"].ToString();
+
+RecordingSession? dbRecordingSession = null;
+
+if (!string.IsNullOrWhiteSpace(formRecordingSessionId))
+{
+    dbRecordingSession = await db.RecordingSessions
+        .FirstOrDefaultAsync(
+            item => item.RecordingSessionId == formRecordingSessionId,
+            cancellationToken
+        );
+}
+
+if (dbRecordingSession == null)
+{
+    dbRecordingSession = await db.RecordingSessions
+        .Where(item =>
+            item.MeetingCode == meetingCode.Trim().ToUpperInvariant() &&
+            item.TeacherEmail == formTeacherEmail.Trim().ToLowerInvariant() &&
+            item.Status == "recording"
+        )
+        .OrderByDescending(item => item.Id)
+        .FirstOrDefaultAsync(cancellationToken);
+}
+
+if (dbRecordingSession == null)
+{
+    dbRecordingSession = new RecordingSession
+    {
+        RecordingSessionId = string.IsNullOrWhiteSpace(formRecordingSessionId)
+            ? Guid.NewGuid().ToString("N")
+            : formRecordingSessionId,
+        CreatedAt = DateTimeOffset.UtcNow
+    };
+
+    db.RecordingSessions.Add(dbRecordingSession);
+}
+
+dbRecordingSession.MeetingCode = string.IsNullOrWhiteSpace(meetingCode)
+    ? dbRecordingSession.MeetingCode
+    : meetingCode.Trim().ToUpperInvariant();
+
+dbRecordingSession.TeacherEmail = string.IsNullOrWhiteSpace(formTeacherEmail)
+    ? dbRecordingSession.TeacherEmail
+    : formTeacherEmail.Trim().ToLowerInvariant();
+
+dbRecordingSession.ClassName = string.IsNullOrWhiteSpace(formClassName)
+    ? dbRecordingSession.ClassName
+    : formClassName.Trim();
+
+dbRecordingSession.Status = "uploaded";
+dbRecordingSession.StoppedAt = DateTimeOffset.UtcNow;
+
+dbRecordingSession.DurationSeconds = int.TryParse(durationSeconds, out var parsedDuration)
+    ? parsedDuration
+    : dbRecordingSession.DurationSeconds;
+
+dbRecordingSession.FileName = uploadedFile.Name ?? safeFileName;
+dbRecordingSession.FileSizeBytes = uploadedFile.Size ?? file.Length;
+dbRecordingSession.DriveFileId = uploadedFile.Id ?? "";
+dbRecordingSession.DriveViewLink = uploadedFile.WebViewLink ?? "";
+dbRecordingSession.DriveContentLink = uploadedFile.WebContentLink ?? "";
+dbRecordingSession.DriveFolderId = folderId;
+dbRecordingSession.UploadError = "";
+dbRecordingSession.LastCheckError = "";
+dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
+
+await db.SaveChangesAsync(cancellationToken);
+        return Results.Ok(new
+        {
+            success = true,
+            message = "Recording uploaded to Google Drive successfully.",
+            recordingSessionId = dbRecordingSession.RecordingSessionId,
+            file = new
+            {
+                id = uploadedFile.Id,
+                name = uploadedFile.Name,
+                mimeType = uploadedFile.MimeType,
+                size = uploadedFile.Size,
+                createdTime = uploadedFile.CreatedTimeDateTimeOffset,
+                webViewLink = uploadedFile.WebViewLink,
+                webContentLink = uploadedFile.WebContentLink
+            }
+        });
+    }
+    catch (Google.GoogleApiException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Google API error while uploading recording to Drive.",
+                statusCode = ex.HttpStatusCode,
+                error = ex.Error?.Message,
+                details = ex.ToString()
+            },
+            statusCode: (int)ex.HttpStatusCode
+        );
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Backend error while uploading recording to Drive.",
+                error = ex.Message,
+                details = ex.ToString()
+            },
+            statusCode: 500
+        );
+    }
+})
+.DisableAntiforgery();
+
+string SanitizeDriveFileName(string value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return $"meet-recording-{DateTime.UtcNow:yyyyMMdd-HHmmss}.webm";
+    }
+
+    var invalidChars = Path.GetInvalidFileNameChars();
+
+    var cleaned = new string(value
+        .Select(ch => invalidChars.Contains(ch) ? '-' : ch)
+        .ToArray());
+
+    cleaned = cleaned
+        .Replace("..", ".")
+        .Trim()
+        .Trim('.');
+
+    if (string.IsNullOrWhiteSpace(cleaned))
+    {
+        return $"meet-recording-{DateTime.UtcNow:yyyyMMdd-HHmmss}.webm";
+    }
+
+    if (!cleaned.EndsWith(".webm", StringComparison.OrdinalIgnoreCase) &&
+        !cleaned.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+    {
+        cleaned += ".webm";
+    }
+
+    return cleaned;
+}
+async Task RunRecordingCronJobAsync(
+    IServiceProvider services,
+    IConfiguration configuration,
+    CancellationToken cancellationToken
+)
+{
+    using var scope = services.CreateScope();
+
+    var db = scope.ServiceProvider.GetRequiredService<ClassroomDbContext>();
+
+    var report = new RecordingCronReport
+    {
+        StartedAt = DateTimeOffset.UtcNow
+    };
+
+    db.RecordingCronReports.Add(report);
+    await db.SaveChangesAsync(cancellationToken);
+
+    try
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        var credential = CreateGoogleCredential(configuration);
+
+        if (credential == null)
+        {
+            report.Error = "Google OAuth token not found. Please connect Google first.";
+            report.FinishedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        if (credential.Token.IsStale)
+        {
+            var refreshed = await credential.RefreshTokenAsync(cancellationToken);
+
+            if (!refreshed)
+            {
+                report.Error = "Google OAuth token expired and refresh failed.";
+                report.FinishedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(cancellationToken);
+                return;
+            }
+        }
+
+        var driveService = new DriveService(
+            new Google.Apis.Services.BaseClientService.Initializer
+            {
+                HttpClientInitializer = credential,
+                ApplicationName = "Algo Meet Recording Cron"
+            }
+        );
+var allSessions = await db.RecordingSessions
+    .ToListAsync(cancellationToken);
+
+var sessions = allSessions
+    .Where(session =>
+        session.CreatedAt >= now.AddDays(-30) ||
+        session.Status != "uploaded"
+    )
+    .ToList();
+
+        report.CheckedCount = sessions.Count;
+
+        var uploadedCount = 0;
+        var uploadFailedCount = 0;
+        var driveMissingCount = 0;
+        var interruptedCount = 0;
+        var syncedCount = 0;
+
+        foreach (var session in sessions)
+        {
+            session.LastCheckedAt = now;
+            session.UpdatedAt = now;
+
+            if (session.Status == "recording" && session.StartedAt < now.AddHours(-3))
+            {
+                session.Status = "interrupted";
+                session.UploadError = "Recording session was not stopped properly.";
+                interruptedCount++;
+                continue;
+            }
+
+            if (session.Status == "uploading" && session.UpdatedAt < now.AddMinutes(-30))
+            {
+                session.Status = "upload_failed";
+                session.UploadError = "Upload timeout.";
+                uploadFailedCount++;
+                continue;
+            }
+
+            if (
+                session.Status == "uploaded" &&
+                !string.IsNullOrWhiteSpace(session.DriveFileId)
+            )
+            {
+                try
+                {
+                    var getRequest = driveService.Files.Get(session.DriveFileId);
+                    getRequest.Fields =
+                        "id,name,mimeType,size,createdTime,modifiedTime,webViewLink,webContentLink,trashed,parents";
+
+                    var driveFile = await getRequest.ExecuteAsync(cancellationToken);
+
+                    if (driveFile.Trashed == true)
+                    {
+                        session.Status = "drive_missing";
+                        session.UploadError = "Drive file was moved to trash.";
+                        driveMissingCount++;
+                        continue;
+                    }
+
+                    session.FileName = driveFile.Name ?? session.FileName;
+                    session.FileSizeBytes = driveFile.Size ?? session.FileSizeBytes;
+                    session.DriveViewLink = driveFile.WebViewLink ?? session.DriveViewLink;
+                    session.DriveContentLink = driveFile.WebContentLink ?? session.DriveContentLink;
+                    session.UploadError = "";
+                    session.LastCheckError = "";
+
+                    syncedCount++;
+                    uploadedCount++;
+                }
+                catch (Google.GoogleApiException ex)
+                {
+                    if (
+                        ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound ||
+                        ex.HttpStatusCode == System.Net.HttpStatusCode.Forbidden
+                    )
+                    {
+                        session.Status = "drive_missing";
+                        session.UploadError = "Drive file not found or permission denied.";
+                        session.LastCheckError = ex.Error?.Message ?? ex.Message;
+                        driveMissingCount++;
+                    }
+                    else
+                    {
+                        session.LastCheckError = ex.Error?.Message ?? ex.Message;
+                    }
+                }
+            }
+
+            if (session.Status == "upload_failed")
+            {
+                uploadFailedCount++;
+            }
+
+            if (session.Status == "interrupted")
+            {
+                interruptedCount++;
+            }
+        }
+
+        var uploadedRetentionDays =
+            configuration.GetValue<int?>("RECORDING_UPLOADED_METADATA_RETENTION_DAYS") ?? 30;
+
+        var errorRetentionDays =
+            configuration.GetValue<int?>("RECORDING_ERROR_METADATA_RETENTION_DAYS") ?? 90;
+var oldUploadedSessions = allSessions
+    .Where(item =>
+        item.Status == "uploaded" &&
+        item.CreatedAt < now.AddDays(-uploadedRetentionDays)
+    )
+    .ToList();
+
+        if (oldUploadedSessions.Count > 0)
+        {
+            db.RecordingSessions.RemoveRange(oldUploadedSessions);
+        }
+
+        var oldErrorSessions = allSessions
+    .Where(item =>
+        item.CreatedAt < now.AddDays(-errorRetentionDays) &&
+        (
+            item.Status == "upload_failed" ||
+            item.Status == "interrupted" ||
+            item.Status == "drive_missing"
+        )
+    )
+    .ToList();
+
+        if (oldErrorSessions.Count > 0)
+        {
+            db.RecordingSessions.RemoveRange(oldErrorSessions);
+        }
+
+    var allReports = await db.RecordingCronReports
+    .ToListAsync(cancellationToken);
+
+var oldReports = allReports
+    .Where(item => item.StartedAt < now.AddDays(0 - errorRetentionDays))
+    .ToList();
+
+        if (oldReports.Count > 0)
+        {
+            db.RecordingCronReports.RemoveRange(oldReports);
+        }
+
+        report.UploadedCount = uploadedCount;
+        report.UploadFailedCount = uploadFailedCount;
+        report.DriveMissingCount = driveMissingCount;
+        report.InterruptedCount = interruptedCount;
+        report.SyncedCount = syncedCount;
+        report.DeletedOldUploadedCount = oldUploadedSessions.Count;
+        report.DeletedOldErrorCount = oldErrorSessions.Count;
+        report.FinishedAt = DateTimeOffset.UtcNow;
+
+        report.SummaryJson = JsonSerializer.Serialize(new
+        {
+            checkedCount = report.CheckedCount,
+            uploadedCount,
+            uploadFailedCount,
+            driveMissingCount,
+            interruptedCount,
+            syncedCount,
+            deletedOldUploadedCount = oldUploadedSessions.Count,
+            deletedOldErrorCount = oldErrorSessions.Count,
+            finishedAt = report.FinishedAt
+        });
+
+        await db.SaveChangesAsync(cancellationToken);
+    }
+    catch (Exception ex)
+    {
+        report.Error = ex.ToString();
+        report.FinishedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(cancellationToken);
+    }
+}
+app.MapGet("/api/google/meet-auto-stop-check", async (
+    IConfiguration configuration,
+    CancellationToken cancellationToken,
+    string? meetingCode,
+    string? teacherEmail,
+    DateTimeOffset? recordingStartedAtUtc,
+    int? quietMinutes
+) =>
+{
+    try
+    {
+        var normalizedMeetingCode = NormalizeMeetingCode(meetingCode);
+        var normalizedTeacherEmail = (teacherEmail ?? "").Trim().ToLowerInvariant();
+        var quietWindowMinutes = Math.Clamp(quietMinutes ?? 2, 1, 30);
+
+        if (string.IsNullOrWhiteSpace(normalizedMeetingCode))
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                shouldStop = false,
+                reason = "Missing meeting code."
+            });
+        }
+
+        var startedAtUtc = recordingStartedAtUtc?.ToUniversalTime();
+
+        var dateFrom = startedAtUtc?.UtcDateTime.Date.AddDays(-1)
+            ?? DateTime.UtcNow.Date.AddDays(-1);
+
+        var dateTo = DateTime.UtcNow.Date.AddDays(1);
+
+        var rows = await BuildMeetAuditSummaryRowsAsync(
+    configuration,
+    cancellationToken,
+    normalizedMeetingCode,
+    dateFrom,
+    dateTo,
+    null
+);  
+
+        var endedRows = rows
+            .Where(row => row.LeftAt.HasValue)
+            .Where(row =>
+                !startedAtUtc.HasValue ||
+                row.LeftAt!.Value.ToUniversalTime() >= startedAtUtc.Value.AddMinutes(-2)
+            )
+            .ToList();
+
+      
+
+        if (endedRows.Count == 0)
+        {
+            return Results.Ok(new
+            {
+                success = true,
+                shouldStop = false,
+                reason = "No matching ended Meet audit row yet.",
+                checkedRows = rows.Count,
+                matchedEndedRows = endedRows.Count
+            });
+        }
+
+        var latestEndedRow = endedRows
+            .OrderByDescending(row => row.LeftAt)
+            .First();
+
+        var latestLeftAtUtc = latestEndedRow.LeftAt!.Value.ToUniversalTime();
+        var secondsSinceLastEnd = (DateTimeOffset.UtcNow - latestLeftAtUtc).TotalSeconds;
+
+        var shouldStop = secondsSinceLastEnd >= quietWindowMinutes * 60;
+
+        return Results.Ok(new
+        {
+            success = true,
+            shouldStop,
+            reason = shouldStop
+                ? "Meet appears ended based on audit logs and quiet window."
+                : "Meet audit row found, waiting for quiet window.",
+            meetingCode = normalizedMeetingCode,
+            teacherEmail = normalizedTeacherEmail,
+            checkedRows = rows.Count,
+            matchedEndedRows = endedRows.Count,
+            quietWindowMinutes,
+            latestLeftAt = MeetAuditFormatVietnamDateTime(latestEndedRow.LeftAt),
+            secondsSinceLastEnd = Math.Round(secondsSinceLastEnd, 1),
+            matchedParticipant = latestEndedRow.StudentEmail,
+            organizerEmail = latestEndedRow.OrganizerEmail
+        });
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                shouldStop = false,
+                message = ex.Message
+            },
+            statusCode: 401
+        );
+    }
+    catch (Google.GoogleApiException ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                shouldStop = false,
+                message = "Google API error while checking Meet auto stop.",
+                statusCode = ex.HttpStatusCode,
+                error = ex.Error?.Message,
+                details = ex.ToString()
+            },
+            statusCode: (int)ex.HttpStatusCode
+        );
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new
+            {
+                success = false,
+                shouldStop = false,
+                message = "Backend error while checking Meet auto stop.",
+                error = ex.Message,
+                details = ex.ToString()
+            },
+            statusCode: 500
+        );
+    }
+});
+app.MapPost("/api/recordings/cron/run", async (
+    IServiceProvider services,
+    IConfiguration configuration,
+    CancellationToken cancellationToken
+) =>
+{
+    await RunRecordingCronJobAsync(services, configuration, cancellationToken);
+
+    return Results.Ok(new
+    {
+        success = true,
+        message = "Recording cron job completed."
+    });
+});
+
+app.MapGet("/api/recordings/cron/reports", async (
+    ClassroomDbContext db,
+    CancellationToken cancellationToken
+) =>
+{
+    var reportRows = await db.RecordingCronReports
+        .ToListAsync(cancellationToken);
+
+    var reports = reportRows
+        .OrderByDescending(item => item.StartedAt)
+        .Take(20)
+        .Select(item => new
+        {
+            item.Id,
+            item.StartedAt,
+            item.FinishedAt,
+            item.CheckedCount,
+            item.UploadedCount,
+            item.UploadFailedCount,
+            item.DriveMissingCount,
+            item.InterruptedCount,
+            item.SyncedCount,
+            item.DeletedOldUploadedCount,
+            item.DeletedOldErrorCount,
+            item.Error,
+            item.SummaryJson
+        })
+        .ToList();
+
+    return Results.Ok(new
+    {
+        success = true,
+        data = reports
+    });
+});
+
+app.MapGet("/api/recordings/sessions", async (
+    ClassroomDbContext db,
+    CancellationToken cancellationToken
+) =>
+{
+    var sessionRows = await db.RecordingSessions
+        .ToListAsync(cancellationToken);
+
+    var sessions = sessionRows
+        .OrderByDescending(item => item.CreatedAt)
+        .Take(100)
+        .Select(item => new
+        {
+            item.Id,
+            item.RecordingSessionId,
+            item.MeetingCode,
+            item.ClassName,
+            item.TeacherEmail,
+            item.Status,
+            item.StartedAt,
+            item.StoppedAt,
+            item.DurationSeconds,
+            item.FileName,
+            item.FileSizeBytes,
+            item.DriveFileId,
+            item.DriveViewLink,
+            item.UploadError,
+            item.LastCheckError,
+            item.LastCheckedAt,
+            item.CreatedAt,
+            item.UpdatedAt
+        })
+        .ToList();
+
+    return Results.Ok(new
+    {
+        success = true,
+        data = sessions
+    });
+});
 app.Run();
 
 public class LiveClassTrackingRequest
@@ -2684,3 +3509,10 @@ public sealed class MeetAuditSummaryRow
     public string IpAddress { get; set; } = "";
     public long NetworkRttMs { get; set; }
 }
+public class RecordingStartRequest
+{
+    public string? MeetingCode { get; set; }
+    public string? CalendarEventId { get; set; }
+    public string? ClassName { get; set; }
+    public string? TeacherEmail { get; set; }
+}   

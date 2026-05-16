@@ -37,38 +37,6 @@ async function request(path, options = {}) {
   return response.json();
 }
 
-function buildMeetAuditSummaryQuery(filters = {}) {
-  const params = new URLSearchParams();
-
-  if (filters.meetingCode?.trim()) {
-    params.append("meetingCode", filters.meetingCode.trim());
-  }
-
-  if (filters.dateFrom) {
-    params.append("dateFrom", filters.dateFrom);
-  }
-
-  if (filters.dateTo) {
-    params.append("dateTo", filters.dateTo);
-  }
-
-  if (filters.attendeeEmail?.trim()) {
-    params.append("attendeeEmail", filters.attendeeEmail.trim());
-  }
-
-  const query = params.toString();
-
-  return query ? `?${query}` : "";
-}
-
-function openDownload(path) {
-  window.open(`${API_BASE_URL}${path}`, "_blank", "noopener,noreferrer");
-}
-
-export function getApiBaseUrl() {
-  return API_BASE_URL;
-}
-
 export function getCourses() {
   return request("/api/courses");
 }
@@ -151,37 +119,12 @@ export function clearLiveClassTracking() {
    GOOGLE MEET ADMIN LOGS
    ========================= */
 
-export function getMeetAuditSummary(filters = {}) {
-  const normalizedFilters =
-    typeof filters === "string"
-      ? { meetingCode: filters }
-      : filters || {};
-
-  const query = buildMeetAuditSummaryQuery(normalizedFilters);
+export function getMeetAuditSummary(meetingCode = "") {
+  const query = meetingCode
+    ? `?meetingCode=${encodeURIComponent(meetingCode)}`
+    : "";
 
   return request(`/api/google/meet-audit-summary${query}`);
-}
-
-export function exportMeetAuditSummaryCsv(filters = {}) {
-  const normalizedFilters =
-    typeof filters === "string"
-      ? { meetingCode: filters }
-      : filters || {};
-
-  const query = buildMeetAuditSummaryQuery(normalizedFilters);
-
-  openDownload(`/api/google/meet-audit-summary/export/csv${query}`);
-}
-
-export function exportMeetAuditSummaryXlsx(filters = {}) {
-  const normalizedFilters =
-    typeof filters === "string"
-      ? { meetingCode: filters }
-      : filters || {};
-
-  const query = buildMeetAuditSummaryQuery(normalizedFilters);
-
-  openDownload(`/api/google/meet-audit-summary/export/xlsx${query}`);
 }
 
 /* =========================
@@ -201,4 +144,228 @@ export function getCalendarEvents(meetingCode = "") {
     : "";
 
   return request(`/api/google/calendar/events${query}`);
+}
+
+/* =========================
+   RECORDING DB SESSION
+   ========================= */
+export function checkMeetAutoStop({
+  meetingCode = "",
+  teacherEmail = "",
+  recordingStartedAtUtc = "",
+  quietMinutes = 2,
+}) {
+  const params = new URLSearchParams();
+
+  if (meetingCode) {
+    params.set("meetingCode", meetingCode);
+  }
+
+  if (teacherEmail) {
+    params.set("teacherEmail", teacherEmail);
+  }
+
+  if (recordingStartedAtUtc) {
+    params.set("recordingStartedAtUtc", recordingStartedAtUtc);
+  }
+
+  params.set("quietMinutes", String(quietMinutes || 2));
+
+  return request(`/api/google/meet-auto-stop-check?${params.toString()}`);
+}
+export function startRecordingSession(payload) {
+  return request("/api/recordings/start", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getRecordingSessions() {
+  return request("/api/recordings/sessions");
+}
+
+export function runRecordingCron() {
+  return request("/api/recordings/cron/run", {
+    method: "POST",
+  });
+}
+
+export function getRecordingCronReports() {
+  return request("/api/recordings/cron/reports");
+}
+
+/* =========================
+   GOOGLE DRIVE RECORDING UPLOAD
+   ========================= */
+
+export async function uploadRecordingToDrive({
+  blob,
+  fileName,
+  recordingSessionId = "",
+  meetingCode = "",
+  teacherEmail = "",
+  className = "",
+  durationSeconds = 0,
+  fileSizeBytes = 0,
+}) {
+  const formData = new FormData();
+
+  formData.append("file", blob, fileName || "meet-recording.webm");
+  formData.append("fileName", fileName || "meet-recording.webm");
+  formData.append("recordingSessionId", recordingSessionId || "");
+  formData.append("meetingCode", meetingCode || "");
+  formData.append("teacherEmail", teacherEmail || "");
+  formData.append("className", className || "");
+  formData.append("durationSeconds", String(durationSeconds || 0));
+  formData.append("fileSizeBytes", String(fileSizeBytes || 0));
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/google/drive/upload-recording`,
+    {
+      method: "POST",
+      body: formData,
+    }
+  );
+
+  if (!response.ok) {
+    let errorMessage = `Upload failed: ${response.status}`;
+
+    try {
+      const errorData = await response.json();
+      errorMessage =
+        errorData?.message ||
+        errorData?.error ||
+        errorData?.details ||
+        errorMessage;
+
+      console.error("Upload error details:", errorData);
+    } catch {
+      const text = await response.text();
+      if (text) {
+        errorMessage = text;
+      }
+    }
+
+    throw new Error(errorMessage);
+  }
+
+  return response.json();
+}
+/* =========================
+   GOOGLE MEET AUDIT EXPORT
+   ========================= */
+
+function buildMeetAuditSummaryQuery(filters = {}) {
+  const params = new URLSearchParams();
+
+  const meetingCode =
+    typeof filters === "string" ? filters : filters.meetingCode || "";
+
+  const eventDateFrom = filters.eventDateFrom || filters.dateFrom || "";
+  const eventDateTo = filters.eventDateTo || filters.dateTo || "";
+  const attendeeEmail = filters.attendeeEmail || "";
+
+  if (meetingCode) {
+    params.set("meetingCode", meetingCode);
+  }
+
+  if (eventDateFrom) {
+    params.set("eventDateFrom", eventDateFrom);
+  }
+
+  if (eventDateTo) {
+    params.set("eventDateTo", eventDateTo);
+  }
+
+  if (attendeeEmail) {
+    params.set("attendeeEmail", attendeeEmail);
+  }
+
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function getFileNameFromContentDisposition(contentDisposition, fallbackFileName) {
+  if (!contentDisposition) {
+    return fallbackFileName;
+  }
+
+  const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1].replace(/"/g, ""));
+  }
+
+  const normalMatch = contentDisposition.match(/filename="?([^"]+)"?/i);
+  if (normalMatch?.[1]) {
+    return normalMatch[1];
+  }
+
+  return fallbackFileName;
+}
+
+async function downloadMeetAuditExport(path, fallbackFileName) {
+  const response = await fetch(`${API_BASE_URL}${path}`);
+
+  if (!response.ok) {
+    let errorMessage = `Export failed: ${response.status}`;
+
+    try {
+      const errorData = await response.json();
+      errorMessage =
+        errorData?.message ||
+        errorData?.error ||
+        errorData?.details ||
+        errorMessage;
+
+      console.error("Export error details:", errorData);
+    } catch {
+      const text = await response.text();
+      if (text) {
+        errorMessage = text;
+      }
+    }
+
+    throw new Error(errorMessage);
+  }
+
+  const blob = await response.blob();
+
+  const fileName = getFileNameFromContentDisposition(
+    response.headers.get("content-disposition"),
+    fallbackFileName
+  );
+
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+
+  link.remove();
+  window.URL.revokeObjectURL(url);
+
+  return {
+    success: true,
+    fileName,
+  };
+}
+
+export function exportMeetAuditSummaryCsv(filters = {}) {
+  const query = buildMeetAuditSummaryQuery(filters);
+
+  return downloadMeetAuditExport(
+    `/api/google/meet-audit-summary/export/csv${query}`,
+    "meet-audit-summary.csv"
+  );
+}
+
+export function exportMeetAuditSummaryXlsx(filters = {}) {
+  const query = buildMeetAuditSummaryQuery(filters);
+
+  return downloadMeetAuditExport(
+    `/api/google/meet-audit-summary/export/xlsx${query}`,
+    "meet-audit-summary.xlsx"
+  );
 }

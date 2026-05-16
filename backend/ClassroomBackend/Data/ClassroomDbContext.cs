@@ -10,6 +10,9 @@ public class ClassroomDbContext : DbContext
     {
     }
 
+    public DbSet<RecordingSession> RecordingSessions => Set<RecordingSession>();
+    public DbSet<RecordingCronReport> RecordingCronReports => Set<RecordingCronReport>();
+
     public DbSet<SyncLogRecord> SyncLogs => Set<SyncLogRecord>();
     public DbSet<QuizAttemptRecord> QuizAttempts => Set<QuizAttemptRecord>();
 }
