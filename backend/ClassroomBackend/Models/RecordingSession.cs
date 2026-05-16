@@ -34,4 +34,8 @@ public class RecordingSession
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public string TempFilePath { get; set; } = "";
+public DateTimeOffset? StagedAt { get; set; }
+public int UploadAttempts { get; set; } = 0;
+public DateTimeOffset? LastUploadAttemptAt { get; set; }
 }

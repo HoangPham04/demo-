@@ -2692,6 +2692,8 @@ app.MapPost("/api/google/drive/upload-recording", async (
     CancellationToken cancellationToken
 ) =>
 {
+    RecordingSession? dbRecordingSession = null;
+
     try
     {
         var credential = CreateGoogleCredential(configuration);
@@ -2771,6 +2773,9 @@ app.MapPost("/api/google/drive/upload-recording", async (
         var meetingCode = form["meetingCode"].ToString();
         var durationSeconds = form["durationSeconds"].ToString();
         var fileSizeBytes = form["fileSizeBytes"].ToString();
+        var formRecordingSessionId = form["recordingSessionId"].ToString();
+        var formTeacherEmail = form["teacherEmail"].ToString();
+        var formClassName = form["className"].ToString();
 
         var originalFileName = string.IsNullOrWhiteSpace(file.FileName)
             ? $"meet-recording-{DateTime.UtcNow:yyyyMMdd-HHmmss}.webm"
@@ -2781,6 +2786,92 @@ app.MapPost("/api/google/drive/upload-recording", async (
         var contentType = string.IsNullOrWhiteSpace(file.ContentType)
             ? "video/webm"
             : file.ContentType;
+
+        if (!string.IsNullOrWhiteSpace(formRecordingSessionId))
+        {
+            dbRecordingSession = await db.RecordingSessions
+                .FirstOrDefaultAsync(
+                    item => item.RecordingSessionId == formRecordingSessionId,
+                    cancellationToken
+                );
+        }
+
+        if (dbRecordingSession == null)
+        {
+            dbRecordingSession = await db.RecordingSessions
+                .Where(item =>
+                    item.MeetingCode == meetingCode.Trim().ToUpperInvariant() &&
+                    item.TeacherEmail == formTeacherEmail.Trim().ToLowerInvariant() &&
+                    item.Status == "recording"
+                )
+                .OrderByDescending(item => item.Id)
+                .FirstOrDefaultAsync(cancellationToken);
+        }
+
+        if (dbRecordingSession == null)
+        {
+            dbRecordingSession = new RecordingSession
+            {
+                RecordingSessionId = string.IsNullOrWhiteSpace(formRecordingSessionId)
+                    ? Guid.NewGuid().ToString("N")
+                    : formRecordingSessionId,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+
+            db.RecordingSessions.Add(dbRecordingSession);
+        }
+
+        dbRecordingSession.MeetingCode = string.IsNullOrWhiteSpace(meetingCode)
+            ? dbRecordingSession.MeetingCode
+            : meetingCode.Trim().ToUpperInvariant();
+
+        dbRecordingSession.TeacherEmail = string.IsNullOrWhiteSpace(formTeacherEmail)
+            ? dbRecordingSession.TeacherEmail
+            : formTeacherEmail.Trim().ToLowerInvariant();
+
+        dbRecordingSession.ClassName = string.IsNullOrWhiteSpace(formClassName)
+            ? dbRecordingSession.ClassName
+            : formClassName.Trim();
+
+        dbRecordingSession.Status = "staged";
+        dbRecordingSession.StoppedAt = DateTimeOffset.UtcNow;
+
+        dbRecordingSession.DurationSeconds = int.TryParse(durationSeconds, out var parsedDuration)
+            ? parsedDuration
+            : dbRecordingSession.DurationSeconds;
+
+        dbRecordingSession.FileName = safeFileName;
+        dbRecordingSession.FileSizeBytes = file.Length;
+        dbRecordingSession.UploadError = "";
+        dbRecordingSession.LastCheckError = "";
+        dbRecordingSession.StagedAt = DateTimeOffset.UtcNow;
+        dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
+
+        var tempRoot =
+            configuration["RECORDING_TEMP_DIR"] ??
+            Environment.GetEnvironmentVariable("RECORDING_TEMP_DIR") ??
+            Path.Combine(AppContext.BaseDirectory, "recording-temp");
+
+        Directory.CreateDirectory(tempRoot);
+
+        var tempFileName = $"{dbRecordingSession.RecordingSessionId}-{safeFileName}";
+
+        foreach (var invalidChar in Path.GetInvalidFileNameChars())
+        {
+            tempFileName = tempFileName.Replace(invalidChar, '-');
+        }
+
+        var tempFilePath = Path.Combine(tempRoot, tempFileName);
+
+        await using (var inputStream = file.OpenReadStream())
+        await using (var outputStream = System.IO.File.Create(tempFilePath))
+        {
+            await inputStream.CopyToAsync(outputStream, cancellationToken);
+        }
+
+        dbRecordingSession.TempFilePath = tempFilePath;
+
+        await db.SaveChangesAsync(cancellationToken);
 
         var driveService = new DriveService(
             new Google.Apis.Services.BaseClientService.Initializer
@@ -2797,108 +2888,88 @@ app.MapPost("/api/google/drive/upload-recording", async (
             Parents = new List<string> { folderId },
             Description =
                 $"Uploaded from Meet report dashboard.\n" +
-                $"Meeting Code: {meetingCode}\n" +
-                $"Duration Seconds: {durationSeconds}\n" +
+                $"Meeting Code: {dbRecordingSession.MeetingCode}\n" +
+                $"Duration Seconds: {dbRecordingSession.DurationSeconds}\n" +
                 $"File Size Bytes: {fileSizeBytes}\n" +
                 $"Uploaded At UTC: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}"
         };
 
-        await using var stream = file.OpenReadStream();
+      Google.Apis.Drive.v3.Data.File? uploadedFile;
 
-        var uploadRequest = driveService.Files.Create(
-            driveFileMetadata,
-            stream,
-            contentType
+await using (var stream = System.IO.File.OpenRead(dbRecordingSession.TempFilePath))
+{
+    var uploadRequest = driveService.Files.Create(
+        driveFileMetadata,
+        stream,
+        contentType
+    );
+
+    uploadRequest.Fields = "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
+
+    var uploadProgress = await uploadRequest.UploadAsync(cancellationToken);
+
+    if (uploadProgress.Status == UploadStatus.Failed)
+    {
+        dbRecordingSession.Status = "upload_failed";
+        dbRecordingSession.UploadError =
+            uploadProgress.Exception?.Message ?? "Google Drive upload failed.";
+        dbRecordingSession.UploadAttempts += 1;
+        dbRecordingSession.LastUploadAttemptAt = DateTimeOffset.UtcNow;
+        dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
+
+        await db.SaveChangesAsync(cancellationToken);
+
+        return Results.Json(
+            new
+            {
+                success = false,
+                message = "Google Drive upload failed. Temporary file is kept for retry.",
+                error = dbRecordingSession.UploadError,
+                recordingSessionId = dbRecordingSession.RecordingSessionId
+            },
+            statusCode: 500
         );
+    }
 
-        uploadRequest.Fields = "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
+    uploadedFile = uploadRequest.ResponseBody;
+}
 
-        var uploadProgress = await uploadRequest.UploadAsync(cancellationToken);
-
-        if (uploadProgress.Status == UploadStatus.Failed)
+        if (uploadedFile == null || string.IsNullOrWhiteSpace(uploadedFile.Id))
         {
-            return Results.Json(
-                new
-                {
-                    success = false,
-                    message = "Google Drive upload failed.",
-                    error = uploadProgress.Exception?.Message
-                },
-                statusCode: 500
-            );
+            throw new InvalidOperationException("Google Drive upload completed but response body/file ID is missing.");
         }
 
-        var uploadedFile = uploadRequest.ResponseBody;
-var formRecordingSessionId = form["recordingSessionId"].ToString();
-var formTeacherEmail = form["teacherEmail"].ToString();
-var formClassName = form["className"].ToString();
+        dbRecordingSession.Status = "uploaded";
+        dbRecordingSession.FileName = uploadedFile.Name ?? safeFileName;
+        dbRecordingSession.FileSizeBytes = uploadedFile.Size ?? file.Length;
+        dbRecordingSession.DriveFileId = uploadedFile.Id ?? "";
+        dbRecordingSession.DriveViewLink = uploadedFile.WebViewLink ?? "";
+        dbRecordingSession.DriveContentLink = uploadedFile.WebContentLink ?? "";
+        dbRecordingSession.DriveFolderId = folderId;
+        dbRecordingSession.UploadError = "";
+        dbRecordingSession.LastCheckError = "";
+        dbRecordingSession.UploadAttempts += 1;
+        dbRecordingSession.LastUploadAttemptAt = DateTimeOffset.UtcNow;
+        dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
 
-RecordingSession? dbRecordingSession = null;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(dbRecordingSession.TempFilePath) &&
+                System.IO.File.Exists(dbRecordingSession.TempFilePath))
+            {
+                System.IO.File.Delete(dbRecordingSession.TempFilePath);
+            }
 
-if (!string.IsNullOrWhiteSpace(formRecordingSessionId))
-{
-    dbRecordingSession = await db.RecordingSessions
-        .FirstOrDefaultAsync(
-            item => item.RecordingSessionId == formRecordingSessionId,
-            cancellationToken
-        );
-}
+            dbRecordingSession.TempFilePath = "";
+        }
+        catch (Exception deleteTempFileException)
+        {
+            dbRecordingSession.LastCheckError =
+                $"Uploaded to Drive, but temp file cleanup failed: {deleteTempFileException.Message}";
+        }
 
-if (dbRecordingSession == null)
-{
-    dbRecordingSession = await db.RecordingSessions
-        .Where(item =>
-            item.MeetingCode == meetingCode.Trim().ToUpperInvariant() &&
-            item.TeacherEmail == formTeacherEmail.Trim().ToLowerInvariant() &&
-            item.Status == "recording"
-        )
-        .OrderByDescending(item => item.Id)
-        .FirstOrDefaultAsync(cancellationToken);
-}
+        await db.SaveChangesAsync(cancellationToken);
 
-if (dbRecordingSession == null)
-{
-    dbRecordingSession = new RecordingSession
-    {
-        RecordingSessionId = string.IsNullOrWhiteSpace(formRecordingSessionId)
-            ? Guid.NewGuid().ToString("N")
-            : formRecordingSessionId,
-        CreatedAt = DateTimeOffset.UtcNow
-    };
-
-    db.RecordingSessions.Add(dbRecordingSession);
-}
-
-dbRecordingSession.MeetingCode = string.IsNullOrWhiteSpace(meetingCode)
-    ? dbRecordingSession.MeetingCode
-    : meetingCode.Trim().ToUpperInvariant();
-
-dbRecordingSession.TeacherEmail = string.IsNullOrWhiteSpace(formTeacherEmail)
-    ? dbRecordingSession.TeacherEmail
-    : formTeacherEmail.Trim().ToLowerInvariant();
-
-dbRecordingSession.ClassName = string.IsNullOrWhiteSpace(formClassName)
-    ? dbRecordingSession.ClassName
-    : formClassName.Trim();
-
-dbRecordingSession.Status = "uploaded";
-dbRecordingSession.StoppedAt = DateTimeOffset.UtcNow;
-
-dbRecordingSession.DurationSeconds = int.TryParse(durationSeconds, out var parsedDuration)
-    ? parsedDuration
-    : dbRecordingSession.DurationSeconds;
-
-dbRecordingSession.FileName = uploadedFile.Name ?? safeFileName;
-dbRecordingSession.FileSizeBytes = uploadedFile.Size ?? file.Length;
-dbRecordingSession.DriveFileId = uploadedFile.Id ?? "";
-dbRecordingSession.DriveViewLink = uploadedFile.WebViewLink ?? "";
-dbRecordingSession.DriveContentLink = uploadedFile.WebContentLink ?? "";
-dbRecordingSession.DriveFolderId = folderId;
-dbRecordingSession.UploadError = "";
-dbRecordingSession.LastCheckError = "";
-dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
-
-await db.SaveChangesAsync(cancellationToken);
         return Results.Ok(new
         {
             success = true,
@@ -2918,27 +2989,51 @@ await db.SaveChangesAsync(cancellationToken);
     }
     catch (Google.GoogleApiException ex)
     {
+        if (dbRecordingSession != null)
+        {
+            dbRecordingSession.Status = "upload_failed";
+            dbRecordingSession.UploadError = ex.Error?.Message ?? ex.Message;
+            dbRecordingSession.UploadAttempts += 1;
+            dbRecordingSession.LastUploadAttemptAt = DateTimeOffset.UtcNow;
+            dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
+
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
         return Results.Json(
             new
             {
                 success = false,
-                message = "Google API error while uploading recording to Drive.",
+                message = "Google API error while uploading recording to Drive. Temporary file is kept for retry if staging succeeded.",
                 statusCode = ex.HttpStatusCode,
                 error = ex.Error?.Message,
-                details = ex.ToString()
+                details = ex.ToString(),
+                recordingSessionId = dbRecordingSession?.RecordingSessionId
             },
             statusCode: (int)ex.HttpStatusCode
         );
     }
     catch (Exception ex)
     {
+        if (dbRecordingSession != null)
+        {
+            dbRecordingSession.Status = "upload_failed";
+            dbRecordingSession.UploadError = ex.Message;
+            dbRecordingSession.UploadAttempts += 1;
+            dbRecordingSession.LastUploadAttemptAt = DateTimeOffset.UtcNow;
+            dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
+
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
         return Results.Json(
             new
             {
                 success = false,
-                message = "Backend error while uploading recording to Drive.",
+                message = "Backend error while uploading recording to Drive. Temporary file is kept for retry if staging succeeded.",
                 error = ex.Message,
-                details = ex.ToString()
+                details = ex.ToString(),
+                recordingSessionId = dbRecordingSession?.RecordingSessionId
             },
             statusCode: 500
         );
@@ -3067,7 +3162,158 @@ var sessions = allSessions
                 uploadFailedCount++;
                 continue;
             }
+            if (
+                (session.Status == "staged" || session.Status == "upload_failed") &&
+                !string.IsNullOrWhiteSpace(session.TempFilePath)
+            )
+            {
+                var retryLimit =
+                    configuration.GetValue<int?>("RECORDING_UPLOAD_RETRY_LIMIT") ?? 3;
 
+                if (session.UploadAttempts >= retryLimit)
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError =
+                        $"Upload retry limit reached. Attempts: {session.UploadAttempts}.";
+                    uploadFailedCount++;
+                    continue;
+                }
+
+                if (!System.IO.File.Exists(session.TempFilePath))
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = "Temporary recording file not found. Cannot retry upload.";
+                    uploadFailedCount++;
+                    continue;
+                }
+
+                var folderId =
+                    configuration["GOOGLE_DRIVE_RECORDING_FOLDER_ID"] ??
+                    configuration["GoogleDrive:RecordingFolderId"];
+
+                if (string.IsNullOrWhiteSpace(folderId))
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = "Google Drive recording folder ID is missing. Cannot retry upload.";
+                    uploadFailedCount++;
+                    continue;
+                }
+
+                try
+                {
+                    var retryFileName = string.IsNullOrWhiteSpace(session.FileName)
+                        ? $"meet-recording-{DateTime.UtcNow:yyyyMMdd-HHmmss}.webm"
+                        : session.FileName;
+
+                    var retryContentType = retryFileName.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
+                        ? "video/mp4"
+                        : "video/webm";
+
+                    var retryMetadata = new Google.Apis.Drive.v3.Data.File
+                    {
+                        Name = retryFileName,
+                        MimeType = retryContentType,
+                        Parents = new List<string> { folderId },
+                        Description =
+                            $"Retried upload from recording cron.\n" +
+                            $"Meeting Code: {session.MeetingCode}\n" +
+                            $"Duration Seconds: {session.DurationSeconds}\n" +
+                            $"File Size Bytes: {session.FileSizeBytes}\n" +
+                            $"Retry At UTC: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}"
+                    };
+
+                    await using var retryStream = System.IO.File.OpenRead(session.TempFilePath);
+
+                    var retryUploadRequest = driveService.Files.Create(
+                        retryMetadata,
+                        retryStream,
+                        retryContentType
+                    );
+
+                    retryUploadRequest.Fields =
+                        "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
+
+                    var retryUploadProgress = await retryUploadRequest.UploadAsync(cancellationToken);
+
+                    session.UploadAttempts += 1;
+                    session.LastUploadAttemptAt = now;
+                    session.UpdatedAt = now;
+
+                    if (retryUploadProgress.Status == UploadStatus.Failed)
+                    {
+                        session.Status = "upload_failed";
+                        session.UploadError =
+                            retryUploadProgress.Exception?.Message ?? "Google Drive retry upload failed.";
+                        uploadFailedCount++;
+                        continue;
+                    }
+
+                    var retryUploadedFile = retryUploadRequest.ResponseBody;
+
+                    if (retryUploadedFile == null || string.IsNullOrWhiteSpace(retryUploadedFile.Id))
+                    {
+                        session.Status = "upload_failed";
+                        session.UploadError = "Google Drive retry upload completed but file ID is missing.";
+                        uploadFailedCount++;
+                        continue;
+                    }
+
+                    session.Status = "uploaded";
+                    session.FileName = retryUploadedFile.Name ?? retryFileName;
+                    session.FileSizeBytes = retryUploadedFile.Size ?? session.FileSizeBytes;
+                    session.DriveFileId = retryUploadedFile.Id ?? "";
+                    session.DriveViewLink = retryUploadedFile.WebViewLink ?? "";
+                    session.DriveContentLink = retryUploadedFile.WebContentLink ?? "";
+                    session.DriveFolderId = folderId;
+                    session.UploadError = "";
+                    session.LastCheckError = "";
+                    session.UpdatedAt = now;
+
+                    try
+                    {
+                        if (System.IO.File.Exists(session.TempFilePath))
+                        {
+                            System.IO.File.Delete(session.TempFilePath);
+                        }
+
+                        session.TempFilePath = "";
+                    }
+                    catch (Exception deleteTempFileException)
+                    {
+                        session.LastCheckError =
+                            $"Retry upload succeeded, but temp file cleanup failed: {deleteTempFileException.Message}";
+                    }
+
+                    syncedCount++;
+                    uploadedCount++;
+
+                    continue;
+                }
+                catch (Google.GoogleApiException ex)
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = ex.Error?.Message ?? ex.Message;
+                    session.LastCheckError = ex.ToString();
+                    session.UploadAttempts += 1;
+                    session.LastUploadAttemptAt = now;
+                    session.UpdatedAt = now;
+
+                    uploadFailedCount++;
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = ex.Message;
+                    session.LastCheckError = ex.ToString();
+                    session.UploadAttempts += 1;
+                    session.LastUploadAttemptAt = now;
+                    session.UpdatedAt = now;
+
+                    uploadFailedCount++;
+                    continue;
+                }
+            }
             if (
                 session.Status == "uploaded" &&
                 !string.IsNullOrWhiteSpace(session.DriveFileId)
@@ -3413,8 +3659,12 @@ app.MapGet("/api/recordings/sessions", async (
             item.FileName,
             item.FileSizeBytes,
             item.DriveFileId,
-            item.DriveViewLink,
-            item.UploadError,
+           item.DriveViewLink,
+item.TempFilePath,
+item.StagedAt,
+item.UploadAttempts,
+item.LastUploadAttemptAt,
+item.UploadError,
             item.LastCheckError,
             item.LastCheckedAt,
             item.CreatedAt,
