@@ -2783,9 +2783,16 @@ app.MapPost("/api/google/drive/upload-recording", async (
 
         var safeFileName = SanitizeDriveFileName(originalFileName);
 
-        var contentType = string.IsNullOrWhiteSpace(file.ContentType)
-            ? "video/webm"
-            : file.ContentType;
+       var rawContentType = string.IsNullOrWhiteSpace(file.ContentType)
+    ? "video/webm"
+    : file.ContentType;
+
+var contentType = rawContentType.Split(';')[0].Trim();
+
+if (string.IsNullOrWhiteSpace(contentType))
+{
+    contentType = "video/webm";
+}
 
         if (!string.IsNullOrWhiteSpace(formRecordingSessionId))
         {
@@ -2833,7 +2840,7 @@ app.MapPost("/api/google/drive/upload-recording", async (
             ? dbRecordingSession.ClassName
             : formClassName.Trim();
 
-        dbRecordingSession.Status = "staged";
+        dbRecordingSession.Status = "staging";
         dbRecordingSession.StoppedAt = DateTimeOffset.UtcNow;
 
         dbRecordingSession.DurationSeconds = int.TryParse(durationSeconds, out var parsedDuration)
@@ -2847,29 +2854,30 @@ app.MapPost("/api/google/drive/upload-recording", async (
         dbRecordingSession.StagedAt = DateTimeOffset.UtcNow;
         dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
 
-        var tempRoot =
-            configuration["RECORDING_TEMP_DIR"] ??
-            Environment.GetEnvironmentVariable("RECORDING_TEMP_DIR") ??
-            Path.Combine(AppContext.BaseDirectory, "recording-temp");
+        var stagingBucket = GetSupabaseRecordingBucket(configuration);
+        var stagingPath = BuildRecordingStagingObjectPath(dbRecordingSession, safeFileName);
 
-        Directory.CreateDirectory(tempRoot);
+        dbRecordingSession.TempStorageProvider = "supabase";
+        dbRecordingSession.TempStorageBucket = stagingBucket;
+        dbRecordingSession.TempStoragePath = stagingPath;
+        dbRecordingSession.TempFilePath = "";
 
-        var tempFileName = $"{dbRecordingSession.RecordingSessionId}-{safeFileName}";
-
-        foreach (var invalidChar in Path.GetInvalidFileNameChars())
-        {
-            tempFileName = tempFileName.Replace(invalidChar, '-');
-        }
-
-        var tempFilePath = Path.Combine(tempRoot, tempFileName);
+        await db.SaveChangesAsync(cancellationToken);
 
         await using (var inputStream = file.OpenReadStream())
-        await using (var outputStream = System.IO.File.Create(tempFilePath))
         {
-            await inputStream.CopyToAsync(outputStream, cancellationToken);
+            await UploadRecordingToSupabaseStorageAsync(
+                configuration,
+                stagingBucket,
+                stagingPath,
+                inputStream,
+                contentType,
+                cancellationToken
+            );
         }
 
-        dbRecordingSession.TempFilePath = tempFilePath;
+        dbRecordingSession.Status = "staged";
+        dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
 
         await db.SaveChangesAsync(cancellationToken);
 
@@ -2894,45 +2902,67 @@ app.MapPost("/api/google/drive/upload-recording", async (
                 $"Uploaded At UTC: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}"
         };
 
-      Google.Apis.Drive.v3.Data.File? uploadedFile;
+        Google.Apis.Drive.v3.Data.File? uploadedFile;
 
-await using (var stream = System.IO.File.OpenRead(dbRecordingSession.TempFilePath))
-{
-    var uploadRequest = driveService.Files.Create(
-        driveFileMetadata,
-        stream,
-        contentType
-    );
-
-    uploadRequest.Fields = "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
-
-    var uploadProgress = await uploadRequest.UploadAsync(cancellationToken);
-
-    if (uploadProgress.Status == UploadStatus.Failed)
-    {
-        dbRecordingSession.Status = "upload_failed";
-        dbRecordingSession.UploadError =
-            uploadProgress.Exception?.Message ?? "Google Drive upload failed.";
-        dbRecordingSession.UploadAttempts += 1;
-        dbRecordingSession.LastUploadAttemptAt = DateTimeOffset.UtcNow;
-        dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
-
-        await db.SaveChangesAsync(cancellationToken);
-
-        return Results.Json(
-            new
+        using (var supabaseHttpClient = new HttpClient())
+        using (var downloadRequest = CreateSupabaseStorageGetRequest(
+            configuration,
+            stagingBucket,
+            stagingPath
+        ))
+        using (var downloadResponse = await supabaseHttpClient.SendAsync(
+            downloadRequest,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken
+        ))
+        {
+            if (!downloadResponse.IsSuccessStatusCode)
             {
-                success = false,
-                message = "Google Drive upload failed. Temporary file is kept for retry.",
-                error = dbRecordingSession.UploadError,
-                recordingSessionId = dbRecordingSession.RecordingSessionId
-            },
-            statusCode: 500
-        );
-    }
+                var details = await downloadResponse.Content.ReadAsStringAsync(cancellationToken);
 
-    uploadedFile = uploadRequest.ResponseBody;
-}
+                throw new InvalidOperationException(
+                    $"Could not read staged recording from Supabase. Status: {(int)downloadResponse.StatusCode}. Details: {details}"
+                );
+            }
+
+            await using var storageStream =
+                await downloadResponse.Content.ReadAsStreamAsync(cancellationToken);
+
+            var uploadRequest = driveService.Files.Create(
+                driveFileMetadata,
+                storageStream,
+                contentType
+            );
+
+            uploadRequest.Fields = "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
+
+            var uploadProgress = await uploadRequest.UploadAsync(cancellationToken);
+
+            if (uploadProgress.Status == UploadStatus.Failed)
+            {
+                dbRecordingSession.Status = "upload_failed";
+                dbRecordingSession.UploadError =
+                    uploadProgress.Exception?.Message ?? "Google Drive upload failed.";
+                dbRecordingSession.UploadAttempts += 1;
+                dbRecordingSession.LastUploadAttemptAt = DateTimeOffset.UtcNow;
+                dbRecordingSession.UpdatedAt = DateTimeOffset.UtcNow;
+
+                await db.SaveChangesAsync(cancellationToken);
+
+                return Results.Json(
+                    new
+                    {
+                        success = false,
+                        message = "Google Drive upload failed. Supabase staged file is kept for retry.",
+                        error = dbRecordingSession.UploadError,
+                        recordingSessionId = dbRecordingSession.RecordingSessionId
+                    },
+                    statusCode: 500
+                );
+            }
+
+            uploadedFile = uploadRequest.ResponseBody;
+        }
 
         if (uploadedFile == null || string.IsNullOrWhiteSpace(uploadedFile.Id))
         {
@@ -2954,18 +2984,22 @@ await using (var stream = System.IO.File.OpenRead(dbRecordingSession.TempFilePat
 
         try
         {
-            if (!string.IsNullOrWhiteSpace(dbRecordingSession.TempFilePath) &&
-                System.IO.File.Exists(dbRecordingSession.TempFilePath))
-            {
-                System.IO.File.Delete(dbRecordingSession.TempFilePath);
-            }
+            await DeleteSupabaseStorageObjectAsync(
+                configuration,
+                stagingBucket,
+                stagingPath,
+                cancellationToken
+            );
 
+            dbRecordingSession.TempStorageProvider = "";
+            dbRecordingSession.TempStorageBucket = "";
+            dbRecordingSession.TempStoragePath = "";
             dbRecordingSession.TempFilePath = "";
         }
-        catch (Exception deleteTempFileException)
+        catch (Exception cleanupException)
         {
             dbRecordingSession.LastCheckError =
-                $"Uploaded to Drive, but temp file cleanup failed: {deleteTempFileException.Message}";
+                $"Uploaded to Drive, but Supabase staging cleanup failed: {cleanupException.Message}";
         }
 
         await db.SaveChangesAsync(cancellationToken);
@@ -3004,7 +3038,7 @@ await using (var stream = System.IO.File.OpenRead(dbRecordingSession.TempFilePat
             new
             {
                 success = false,
-                message = "Google API error while uploading recording to Drive. Temporary file is kept for retry if staging succeeded.",
+                message = "Google API error while uploading recording to Drive. Supabase staged file is kept for retry if staging succeeded.",
                 statusCode = ex.HttpStatusCode,
                 error = ex.Error?.Message,
                 details = ex.ToString(),
@@ -3030,7 +3064,7 @@ await using (var stream = System.IO.File.OpenRead(dbRecordingSession.TempFilePat
             new
             {
                 success = false,
-                message = "Backend error while uploading recording to Drive. Temporary file is kept for retry if staging succeeded.",
+                message = "Backend error while uploading recording to Drive. Supabase staged file is kept for retry if staging succeeded.",
                 error = ex.Message,
                 details = ex.ToString(),
                 recordingSessionId = dbRecordingSession?.RecordingSessionId
@@ -3040,7 +3074,181 @@ await using (var stream = System.IO.File.OpenRead(dbRecordingSession.TempFilePat
     }
 })
 .DisableAntiforgery();
+string GetSupabaseUrl(IConfiguration configuration)
+{
+    var value =
+        configuration["SUPABASE_URL"] ??
+        configuration["Supabase:Url"] ??
+        Environment.GetEnvironmentVariable("SUPABASE_URL");
 
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        throw new InvalidOperationException("SUPABASE_URL is missing.");
+    }
+
+    return value.Trim().TrimEnd('/');
+}
+
+string GetSupabaseServiceRoleKey(IConfiguration configuration)
+{
+    var value =
+        configuration["SUPABASE_SERVICE_ROLE_KEY"] ??
+        configuration["Supabase:ServiceRoleKey"] ??
+        Environment.GetEnvironmentVariable("SUPABASE_SERVICE_ROLE_KEY");
+
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        throw new InvalidOperationException("SUPABASE_SERVICE_ROLE_KEY is missing.");
+    }
+
+    return value.Trim();
+}
+
+string GetSupabaseRecordingBucket(IConfiguration configuration)
+{
+    var value =
+        configuration["SUPABASE_RECORDING_BUCKET"] ??
+        configuration["Supabase:RecordingBucket"] ??
+        Environment.GetEnvironmentVariable("SUPABASE_RECORDING_BUCKET") ??
+        "recording-staging";
+
+    return value.Trim();
+}
+
+string EncodeSupabaseObjectPath(string objectPath)
+{
+    return string.Join(
+        "/",
+        objectPath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(Uri.EscapeDataString)
+    );
+}
+
+string BuildSupabaseObjectUrl(
+    IConfiguration configuration,
+    string bucket,
+    string objectPath
+)
+{
+    var supabaseUrl = GetSupabaseUrl(configuration);
+    var encodedBucket = Uri.EscapeDataString(bucket);
+    var encodedPath = EncodeSupabaseObjectPath(objectPath);
+
+    return $"{supabaseUrl}/storage/v1/object/{encodedBucket}/{encodedPath}";
+}
+
+string BuildRecordingStagingObjectPath(
+    RecordingSession session,
+    string safeFileName
+)
+{
+    var datePrefix = DateTime.UtcNow.ToString("yyyy/MM/dd");
+
+    var cleanFileName = safeFileName;
+
+    foreach (var invalidChar in Path.GetInvalidFileNameChars())
+    {
+        cleanFileName = cleanFileName.Replace(invalidChar, '-');
+    }
+
+    return $"recordings/{datePrefix}/{session.RecordingSessionId}/{cleanFileName}";
+}
+
+HttpRequestMessage CreateSupabaseStorageGetRequest(
+    IConfiguration configuration,
+    string bucket,
+    string objectPath
+)
+{
+    var url = BuildSupabaseObjectUrl(configuration, bucket, objectPath);
+    var key = GetSupabaseServiceRoleKey(configuration);
+
+    var request = new HttpRequestMessage(HttpMethod.Get, url);
+    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+    request.Headers.TryAddWithoutValidation("apikey", key);
+
+    return request;
+}
+
+async Task UploadRecordingToSupabaseStorageAsync(
+    IConfiguration configuration,
+    string bucket,
+    string objectPath,
+    Stream inputStream,
+    string contentType,
+    CancellationToken cancellationToken
+)
+{
+    var url = BuildSupabaseObjectUrl(configuration, bucket, objectPath);
+    var key = GetSupabaseServiceRoleKey(configuration);
+
+    using var httpClient = new HttpClient();
+    using var request = new HttpRequestMessage(HttpMethod.Post, url);
+
+    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+    request.Headers.TryAddWithoutValidation("apikey", key);
+    request.Headers.TryAddWithoutValidation("x-upsert", "true");
+
+    request.Content = new StreamContent(inputStream);
+    request.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+
+    using var response = await httpClient.SendAsync(
+        request,
+        HttpCompletionOption.ResponseHeadersRead,
+        cancellationToken
+    );
+
+    if (!response.IsSuccessStatusCode)
+    {
+        var details = await response.Content.ReadAsStringAsync(cancellationToken);
+
+        throw new InvalidOperationException(
+            $"Supabase staging upload failed. Status: {(int)response.StatusCode}. Details: {details}"
+        );
+    }
+}
+
+async Task DeleteSupabaseStorageObjectAsync(
+    IConfiguration configuration,
+    string bucket,
+    string objectPath,
+    CancellationToken cancellationToken
+)
+{
+    var supabaseUrl = GetSupabaseUrl(configuration);
+    var key = GetSupabaseServiceRoleKey(configuration);
+    var encodedBucket = Uri.EscapeDataString(bucket);
+
+    using var httpClient = new HttpClient();
+    using var request = new HttpRequestMessage(
+        HttpMethod.Delete,
+        $"{supabaseUrl}/storage/v1/object/{encodedBucket}"
+    );
+
+    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+    request.Headers.TryAddWithoutValidation("apikey", key);
+
+    request.Content = new StringContent(
+        JsonSerializer.Serialize(new
+        {
+            prefixes = new[] { objectPath }
+        }),
+        Encoding.UTF8,
+        "application/json"
+    );
+
+    using var response = await httpClient.SendAsync(request, cancellationToken);
+
+    if (!response.IsSuccessStatusCode)
+    {
+        var details = await response.Content.ReadAsStringAsync(cancellationToken);
+
+        throw new InvalidOperationException(
+            $"Supabase staging cleanup failed. Status: {(int)response.StatusCode}. Details: {details}"
+        );
+    }
+}
 string SanitizeDriveFileName(string value)
 {
     if (string.IsNullOrWhiteSpace(value))
@@ -3282,6 +3490,184 @@ var sessions = allSessions
                     {
                         session.LastCheckError =
                             $"Retry upload succeeded, but temp file cleanup failed: {deleteTempFileException.Message}";
+                    }
+
+                    syncedCount++;
+                    uploadedCount++;
+
+                    continue;
+                }
+                catch (Google.GoogleApiException ex)
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = ex.Error?.Message ?? ex.Message;
+                    session.LastCheckError = ex.ToString();
+                    session.UploadAttempts += 1;
+                    session.LastUploadAttemptAt = now;
+                    session.UpdatedAt = now;
+
+                    uploadFailedCount++;
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = ex.Message;
+                    session.LastCheckError = ex.ToString();
+                    session.UploadAttempts += 1;
+                    session.LastUploadAttemptAt = now;
+                    session.UpdatedAt = now;
+
+                    uploadFailedCount++;
+                    continue;
+                }
+            }
+                        if (
+                (session.Status == "staged" || session.Status == "upload_failed") &&
+                session.TempStorageProvider == "supabase" &&
+                !string.IsNullOrWhiteSpace(session.TempStorageBucket) &&
+                !string.IsNullOrWhiteSpace(session.TempStoragePath)
+            )
+            {
+                var retryLimit =
+                    configuration.GetValue<int?>("RECORDING_UPLOAD_RETRY_LIMIT") ?? 3;
+
+                if (session.UploadAttempts >= retryLimit)
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError =
+                        $"Upload retry limit reached. Attempts: {session.UploadAttempts}.";
+                    uploadFailedCount++;
+                    continue;
+                }
+
+                var folderId =
+                    configuration["GOOGLE_DRIVE_RECORDING_FOLDER_ID"] ??
+                    configuration["GoogleDrive:RecordingFolderId"];
+
+                if (string.IsNullOrWhiteSpace(folderId))
+                {
+                    session.Status = "upload_failed";
+                    session.UploadError = "Google Drive recording folder ID is missing. Cannot retry upload.";
+                    uploadFailedCount++;
+                    continue;
+                }
+
+                try
+                {
+                    var retryFileName = string.IsNullOrWhiteSpace(session.FileName)
+                        ? $"meet-recording-{DateTime.UtcNow:yyyyMMdd-HHmmss}.webm"
+                        : session.FileName;
+
+                    var retryContentType = retryFileName.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
+                        ? "video/mp4"
+                        : "video/webm";
+
+                    var retryMetadata = new Google.Apis.Drive.v3.Data.File
+                    {
+                        Name = retryFileName,
+                        MimeType = retryContentType,
+                        Parents = new List<string> { folderId },
+                        Description =
+                            $"Retried upload from Supabase staging.\n" +
+                            $"Meeting Code: {session.MeetingCode}\n" +
+                            $"Duration Seconds: {session.DurationSeconds}\n" +
+                            $"File Size Bytes: {session.FileSizeBytes}\n" +
+                            $"Retry At UTC: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}"
+                    };
+
+                    Google.Apis.Drive.v3.Data.File? retryUploadedFile;
+
+                    using (var supabaseHttpClient = new HttpClient())
+                    using (var downloadRequest = CreateSupabaseStorageGetRequest(
+                        configuration,
+                        session.TempStorageBucket,
+                        session.TempStoragePath
+                    ))
+                    using (var downloadResponse = await supabaseHttpClient.SendAsync(
+                        downloadRequest,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        cancellationToken
+                    ))
+                    {
+                        if (!downloadResponse.IsSuccessStatusCode)
+                        {
+                            var details = await downloadResponse.Content.ReadAsStringAsync(cancellationToken);
+
+                            session.Status = "upload_failed";
+                            session.UploadError =
+                                $"Could not read staged recording from Supabase. Status: {(int)downloadResponse.StatusCode}. Details: {details}";
+                            uploadFailedCount++;
+                            continue;
+                        }
+
+                        await using var storageStream =
+                            await downloadResponse.Content.ReadAsStreamAsync(cancellationToken);
+
+                        var retryUploadRequest = driveService.Files.Create(
+                            retryMetadata,
+                            storageStream,
+                            retryContentType
+                        );
+
+                        retryUploadRequest.Fields =
+                            "id,name,mimeType,size,createdTime,webViewLink,webContentLink,parents";
+
+                        var retryUploadProgress = await retryUploadRequest.UploadAsync(cancellationToken);
+
+                        session.UploadAttempts += 1;
+                        session.LastUploadAttemptAt = now;
+                        session.UpdatedAt = now;
+
+                        if (retryUploadProgress.Status == UploadStatus.Failed)
+                        {
+                            session.Status = "upload_failed";
+                            session.UploadError =
+                                retryUploadProgress.Exception?.Message ?? "Google Drive retry upload failed.";
+                            uploadFailedCount++;
+                            continue;
+                        }
+
+                        retryUploadedFile = retryUploadRequest.ResponseBody;
+                    }
+
+                    if (retryUploadedFile == null || string.IsNullOrWhiteSpace(retryUploadedFile.Id))
+                    {
+                        session.Status = "upload_failed";
+                        session.UploadError = "Google Drive retry upload completed but file ID is missing.";
+                        uploadFailedCount++;
+                        continue;
+                    }
+
+                    session.Status = "uploaded";
+                    session.FileName = retryUploadedFile.Name ?? retryFileName;
+                    session.FileSizeBytes = retryUploadedFile.Size ?? session.FileSizeBytes;
+                    session.DriveFileId = retryUploadedFile.Id ?? "";
+                    session.DriveViewLink = retryUploadedFile.WebViewLink ?? "";
+                    session.DriveContentLink = retryUploadedFile.WebContentLink ?? "";
+                    session.DriveFolderId = folderId;
+                    session.UploadError = "";
+                    session.LastCheckError = "";
+                    session.UpdatedAt = now;
+
+                    try
+                    {
+                        await DeleteSupabaseStorageObjectAsync(
+                            configuration,
+                            session.TempStorageBucket,
+                            session.TempStoragePath,
+                            cancellationToken
+                        );
+
+                        session.TempStorageProvider = "";
+                        session.TempStorageBucket = "";
+                        session.TempStoragePath = "";
+                        session.TempFilePath = "";
+                    }
+                    catch (Exception cleanupException)
+                    {
+                        session.LastCheckError =
+                            $"Retry upload succeeded, but Supabase staging cleanup failed: {cleanupException.Message}";
                     }
 
                     syncedCount++;
@@ -3647,7 +4033,7 @@ app.MapGet("/api/recordings/sessions", async (
         .Take(100)
         .Select(item => new
         {
-            item.Id,
+                        item.Id,
             item.RecordingSessionId,
             item.MeetingCode,
             item.ClassName,
@@ -3659,12 +4045,15 @@ app.MapGet("/api/recordings/sessions", async (
             item.FileName,
             item.FileSizeBytes,
             item.DriveFileId,
-           item.DriveViewLink,
-item.TempFilePath,
-item.StagedAt,
-item.UploadAttempts,
-item.LastUploadAttemptAt,
-item.UploadError,
+            item.DriveViewLink,
+            item.TempFilePath,
+            item.TempStorageProvider,
+            item.TempStorageBucket,
+            item.TempStoragePath,
+            item.StagedAt,
+            item.UploadAttempts,
+            item.LastUploadAttemptAt,
+            item.UploadError,
             item.LastCheckError,
             item.LastCheckedAt,
             item.CreatedAt,

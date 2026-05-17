@@ -38,4 +38,7 @@ public class RecordingSession
 public DateTimeOffset? StagedAt { get; set; }
 public int UploadAttempts { get; set; } = 0;
 public DateTimeOffset? LastUploadAttemptAt { get; set; }
+public string TempStorageProvider { get; set; } = "";
+public string TempStorageBucket { get; set; } = "";
+public string TempStoragePath { get; set; } = "";
 }

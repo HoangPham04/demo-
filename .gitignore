@@ -54,3 +54,4 @@ backend/ClassroomBackend/appsettings.Development.json
 
 # Local live tracking data
 backend/ClassroomBackend/Data/live-tracking-events.json
+runtime-coder/
